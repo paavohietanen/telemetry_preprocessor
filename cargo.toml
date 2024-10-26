@@ -1,0 +1,11 @@
+[package]
+name = "telemetry_processor"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [
+    "telemetry_processor",
+]
+
+[dependencies]
