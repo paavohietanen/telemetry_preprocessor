@@ -4,6 +4,7 @@ use aws_sdk_kinesis::config;
 use aws_sdk_sqs::types::Message;
 use aws_sdk_sqs::{Client, Config, config::Region};
 use base64::{self, Engine, engine::general_purpose};
+use jsonschema::{self, ValidationError};
 use serde::{Serialize, Deserialize};
 use tokio::time::sleep;
 use std::sync::Arc;
@@ -54,6 +55,79 @@ fn decode_base64(encoded_data: &str) -> Result<Vec<u8>, base64::DecodeError> {
     general_purpose::STANDARD.decode(encoded_data)
 }
 
+// Helper function to validate JSON against a schema
+async fn validate_json(json_str: &str) -> bool {
+    // Initiate the control schema
+    print!(" === INITIATING SCHEMA === ");
+    let control_schema = serde_json::json!({
+        "$schema": "http://json-schema.org/draft-2020-12/schema",
+        "type": "object",
+        "properties": {
+            "submission_id": { "type": "string" },
+            "device_id": { "type": "string" },
+            "time_created": { "type": "string", "format": "date-time" },
+            "events": {
+                "type": "object",
+                "properties": {
+                    "new_process": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "cmdl": { "type": "string" },
+                                "user": { "type": "string" }
+                            },
+                            "required": ["cmdl", "user"]
+                        }
+                    },
+                    "network_connection": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "source_ip": { "type": "string" },
+                                "destination_ip": { "type": "string" },
+                                "destination_port": { 
+                                    "type": "integer", 
+                                    "minimum": 0, 
+                                    "maximum": 65535 
+                                }
+                            },
+                            "required": ["source_ip", "destination_ip", "destination_port"]
+                        }
+                    }
+                },
+                "required": ["new_process", "network_connection"]
+            }
+        },
+        "required": ["submission_id", "device_id", "time_created", "events"]
+    });
+
+    // Initiate schema validator
+    let validator = match jsonschema::validator_for(&control_schema) {
+        Ok(validator) => validator,
+        Err(error) => {
+            println!("Error creating JSON schema validator: {:?}", error);
+            return false;
+        },
+    };
+    println!(" === VALIDATING JSON === ");
+    let json_data = match serde_json::from_str(json_str) {
+        Ok(json_data) => json_data,
+        Err(error) => {
+            println!("Error parsing JSON to 'Value': {:?}", error);
+            return false;
+        },
+    };
+    match validator.validate(&json_data) {
+        Ok(_) => true,
+        Err(error) => {
+            println!("Validation error: {:?}", error);
+            false
+        }
+    }
+}
+
 // Handles
 // - Reading of submissions from the SQS
 // - Validating and processing them
@@ -70,45 +144,6 @@ impl SubmissionWorker {
         Self { client }
     }
 
-    // Process submissions function
-    pub async fn process_submission(&self, submission: &Message) {
-        if let Some(body) = &submission.body {
-            // Decode the base64 encoded submission
-            let decoded_data =  match decode_base64(body) {
-                Ok(decoded_data) => { 
-                    println!("Decoded successfully: {:?}", decoded_data);
-                    decoded_data
-                },
-                Err(error) => {
-                    println!("Error decoding submission: {:?}", error);
-                    return;
-                }
-            };
-            // Convert the decoded data to a string
-            let submission_str = match String::from_utf8(decoded_data) {
-                Ok(submission_str) => {
-                    println!("Submission string: {:?}", submission_str);
-                    submission_str
-                },
-                Err(error) => {
-                    println!("Error converting submission to string: {:?}", error);
-                    return;
-                }
-            };
-            // Deserialize the json string to a Submission struct
-            let submission: Submission = match serde_json::from_str(&submission_str) {
-                Ok(submission) => {
-                    println!("Deserialized submission: {:?}", submission);
-                    submission
-                },
-                Err(error) => {
-                    println!("Error deserializing submission: {:?}", error);
-                    return;
-                }
-            };
-        }
-    }
-
     // Main loop for submission processing
     pub async fn run(self) {
 
@@ -123,15 +158,15 @@ impl SubmissionWorker {
                 Ok(submission) => {
                     if let Some(messages) = submission.messages {
                         for message in messages {
-                            println!("Received message: {:?}", message);
                             let processor = self.clone();
+                            // TODO: error handling
                             task::spawn(async move {
                                 processor.process_submission(&message).await;
                             });
                         }
                     }
                     // sleep for one second
-                    sleep(time::Duration::from_secs(1)).await;
+                    //sleep(time::Duration::from_secs(1)).await;
                 },
                 Err(error) => {
                     println!("Error receiving messages: {:?}", error);
@@ -139,6 +174,43 @@ impl SubmissionWorker {
             };
         }
     }
+
+    // Process submissions function
+    pub async fn process_submission(&self, submission: &Message) {
+        if let Some(body) = &submission.body {
+            // Decode the base64 encoded submission
+            let decoded_data =  match decode_base64(body) {
+                Ok(decoded_data) => decoded_data,
+                Err(error) => {
+                    println!("Error decoding submission: {:?}", error);
+                    return;
+                }
+            };
+            // Convert the decoded data to a string
+            let submission_str = match String::from_utf8(decoded_data) {
+                Ok(submission_str) => submission_str,
+                Err(error) => {
+                    println!("Error converting submission to string: {:?}", error);
+                    return;
+                }
+            };
+            // Deserialize the json string to a Submission struct
+            let submission: Submission = match serde_json::from_str(&submission_str) {
+                Ok(submission) => submission,
+                Err(error) => {
+                    println!("Error deserializing submission: {:?}", error);
+                    return;
+                }
+            };
+            //TODO: Json schema validation
+            // Validate the submission by checking if it matches the expected structure
+            //let is_valid = validate_json(&submission_str).then({print!("Submission is valid: {:?}", is_valid);});
+            
+
+        }
+    }
+
+    
 }
 
 
