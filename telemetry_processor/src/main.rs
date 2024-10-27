@@ -3,11 +3,49 @@ use aws_config::BehaviorVersion;
 use aws_sdk_kinesis::config;
 use aws_sdk_sqs::types::Message;
 use aws_sdk_sqs::{Client, Config, config::Region};
+use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 use tokio::{runtime::Runtime, sync::Semaphore};
 use tokio::{task, time};
 use tokio_stream::StreamExt;
 
+#[derive(Debug, Serialize, Deserialize)]
+struct Submission {
+    // Unique identifier for the submission
+    submission_id: String,
+    // Unique identifier for the device
+    device_id: String,
+    // Creation time of the submission, device local time
+    time_created: String,
+    // Corresponding event data
+    events: Event,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Event {
+    // List of new process events
+    new_process: Vec<NewProcess>,
+    // List of network connection events
+    network_connection: Vec<NetworkConnection>
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NewProcess {
+    // Command line of the process
+    cmdl: String,
+    // Username that started the process
+    user: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NetworkConnection {
+    // IPv4
+    source_ip: String,
+    // IpV4
+    destination_ip: String,
+    // Range of 0-65535
+    destination_port: u16,
+}
 
 // Handles
 // - Reading of submissions from the SQS
