@@ -50,6 +50,28 @@ struct NetworkConnection {
     destination_port: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum EventType {
+    NewProcess(NewProcess),
+    NetworkConnection(NetworkConnection),
+}
+
+// EventWrapper struct to hold single processed events
+#[derive(Debug, Serialize, Deserialize)]
+struct EventWrapper {
+    // Event type with its corresponding data
+    event_type: EventType,
+    // Unique identifier of the event
+    event_id: String,
+    // Unique identifier for the submission event belongs to
+    submission_id: String,
+    // Order number in submission
+    order: u32,
+    // Creation time of the submission, device local time
+    time_created: String,
+    // Processing time of the event, application local time
+}
+
 // Helper function to decode base64 binary data
 fn decode_base64(encoded_data: &str) -> Result<Vec<u8>, base64::DecodeError> {
     general_purpose::STANDARD.decode(encoded_data)
@@ -205,12 +227,43 @@ impl SubmissionWorker {
             //TODO: Json schema validation
             // Validate the submission by checking if it matches the expected structure
             //let is_valid = validate_json(&submission_str).then({print!("Submission is valid: {:?}", is_valid);});
+
+            // Create a new vector for events in eventWrappers
+            let mut events = Vec::<EventWrapper>::new();
+
+            // Loop through the new process events in the submission
+            for (order, event) in submission.events.new_process.iter().enumerate() {
+                // Create an EventWrapper struct to hold the event data
+                let event_wrapper = EventWrapper {
+                    event_type: EventType::NewProcess(event.clone()),
+                    event_id: "some_event_id".to_string(),
+                    submission_id: submission.submission_id.clone(),
+                    order: order as u32,
+                    time_created: submission.time_created.clone(),
+                };
+                // Add the event to the events vector
+                events.push(event_wrapper);
+            }
+
+            // Loop through the network connection events in the submission
+            for (order, event) in submission.events.network_connection.iter().enumerate() {
+                // Create an EventWrapper struct to hold the event data
+                let event_wrapper = EventWrapper {
+                    event_type: EventType::NetworkConnection(event.clone()),
+                    event_id: "some_event_id".to_string(),
+                    submission_id: submission.submission_id.clone(),
+                    order: order as u32,
+                    time_created: submission.time_created.clone(),
+                };
+                // Add the event to the events vector
+                events.push(event_wrapper);
+            }
             
 
         }
     }
 
-    
+
 }
 
 
