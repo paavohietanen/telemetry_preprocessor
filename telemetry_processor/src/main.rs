@@ -1,20 +1,13 @@
-use aws_config::imds::client;
-use aws_config::BehaviorVersion;
-use aws_sdk_kinesis::config;
-use aws_sdk_kinesis::error::SdkError;
-use aws_sdk_kinesis::operation::put_record::PutRecordError;
-use aws_sdk_kinesis::types::error;
+
+use aws_sdk_kinesis::{Client as KinesisClient, config as KinesisConfig, config::Region};
 use aws_sdk_sqs::types::Message;
-use aws_sdk_sqs::{Client, Config, config::Region};
+use aws_sdk_sqs::{Client as SQSClient, config as SQSConfig};
 use base64::{self, Engine, engine::general_purpose};
 use futures;
-use jsonschema::{self, ValidationError};
+use jsonschema::{self};
 use serde::{Serialize, Deserialize};
 use tokio::time::sleep;
-use std::sync::Arc;
-use tokio::{runtime::Runtime, sync::Semaphore};
 use tokio::{task, time};
-use tokio_stream::StreamExt;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Submission {
@@ -56,7 +49,9 @@ struct NetworkConnection {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum EventType {
+    // Event type for new process
     NewProcess(NewProcess),
+    // Event type for network connection
     NetworkConnection(NetworkConnection),
 }
 
@@ -83,8 +78,8 @@ fn decode_base64(encoded_data: &str) -> Result<Vec<u8>, base64::DecodeError> {
 
 // Helper function to validate JSON against a schema
 async fn is_valid_submission(json_str: &str) -> bool {
+
     // Initiate the control schema
-    println!(" === INITIATING SCHEMA === ");
     let control_schema = serde_json::json!({
         "type": "object",
         "properties": {
@@ -128,6 +123,7 @@ async fn is_valid_submission(json_str: &str) -> bool {
         "required": ["submission_id", "device_id", "time_created", "events"]
     });
 
+    // Parse the JSON string to a 'Value' type
     let json_data = match serde_json::from_str(json_str) {
         Ok(json_data) => json_data,
         Err(error) => {
@@ -136,6 +132,7 @@ async fn is_valid_submission(json_str: &str) -> bool {
         },
     };
 
+    // Validate the JSON data against the control schema
     if jsonschema::is_valid(&control_schema, &json_data) {
         println!("Valid JSON!");
         return true;
@@ -153,7 +150,11 @@ async fn is_valid_submission(json_str: &str) -> bool {
 //   the resource for other Processors upon failure
 #[derive(Clone)]
 struct SubmissionWorker {
-    sqs_client: aws_sdk_sqs::Client,
+
+    // SQS client for reading submissions
+    sqs_client: SQSClient,
+
+    // Kinesis client for writing events
     kinesis_client: aws_sdk_kinesis::Client,
 }
 
@@ -168,8 +169,7 @@ impl SubmissionWorker {
         // Polling loop with individual task spawn for each submission
         loop {
             // Read a submission from SQS, spawn a task to process it or log an error
-            let result = match self
-                .sqs_client
+            match self.sqs_client
                 .receive_message()
                 .send()
                 .await {
@@ -235,8 +235,11 @@ impl SubmissionWorker {
             // Create a new vector for events in eventWrappers
             let mut events = Vec::<EventWrapper>::new();
 
+            // Initiate order number for events
+            let mut order = 0;
+
             // Loop through the new process events in the submission
-            for (order, event) in submission.events.new_process.iter().enumerate() {
+            for event in submission.events.new_process {
                 // Create an EventWrapper struct to hold the event data
                 let event_wrapper = EventWrapper {
                     event_type: EventType::NewProcess(event.clone()),
@@ -247,10 +250,11 @@ impl SubmissionWorker {
                 };
                 // Add the event to the events vector
                 events.push(event_wrapper);
+                order += 1;
             }
 
             // Loop through the network connection events in the submission
-            for (order, event) in submission.events.network_connection.iter().enumerate() {
+            for event in submission.events.network_connection {
                 // Create an EventWrapper struct to hold the event data
                 let event_wrapper = EventWrapper {
                     event_type: EventType::NetworkConnection(event.clone()),
@@ -261,27 +265,102 @@ impl SubmissionWorker {
                 };
                 // Add the event to the events vector
                 events.push(event_wrapper);
+                order += 1;
             }
 
-            /*match &self.handle_writing(events).await {
+            // Start the writing task for current submission
+            match &self.handle_writing(events).await {
                 Ok(_) => println!("All events written successfully."),
                 Err(e) => eprintln!("Failed to write events: {:?}", e),
-            }*/
+            }
 
         }
     }
 
+    async fn handle_writing(&self, events: Vec<EventWrapper>) -> Result<(), Box<dyn std::error::Error>> {
+        // Create futures for all `write` calls
+        let futures: Vec<_> = events
+            .into_iter()
+            .map(|event| self.write(event))
+            .collect();
+
+        // Await all futures concurrently
+        let results = futures::future::join_all(futures).await;
+
+        for result in results {
+            if !result { // Check if write was successful
+                return Err("Failed to write event".into());
+            }
+        }
+        Ok(())
+    }
+
+    async fn write(&self, event: EventWrapper) -> bool {
+
+        // Set the initial retry wait time
+        let mut wait_time = tokio::time::Duration::from_secs(1);
+
+        // Set the maximum number of retries
+        let max_retries = 3;
+
+        // Serialize the event to a JSON string
+        let json_string = match serde_json::to_string(&event) {
+            Ok(s) => s,
+            Err(err) => {
+                println!("Error serializing event: {:?}", err);
+                return false;
+            }
+        };
+
+        // PutRecord() needs input as Blobs, ceate a Blob from the JSON string
+        let data = aws_sdk_kinesis::primitives::Blob::new(json_string.as_bytes());
+
+        // Set the shard ID/Partition key
+        let shard = "shardId-000000000000";
+
+        // Try to write the event to the Kinesis stream
+        for attempt in 0..max_retries {
+            let result = self.kinesis_client
+                .put_record()                                       // PutRecord operation
+                .data(data.clone())                          // Clone of the original data as input
+                .partition_key(shard)                        // Shard ID as partition key
+                .stream_name("events")                       // Target Kinesis stream name
+                .send()
+                .await;
+
+            match result {
+                Ok(response) => {
+                    println!("Put record successful: {:?}", response);
+                    return true; // Success
+                }
+
+                // If not successful, log the error and retry
+                Err(err) => {
+                    println!("Error writing event, attempt {}: {:?}", attempt + 1, err);
+                    if attempt < max_retries - 1 {
+                        sleep(wait_time).await;
+                         // Exponential backoff to allow causes of possible congestion to ease off
+                        wait_time *= 2;
+                    }
+                }
+            }
+        }
+
+        // Failed after maximum number of retries
+        false
+    
+    }
 }
 
 
 #[tokio::main]
 async fn main() {
     // Build the configuration for SQS
-    let sqs_config = aws_sdk_sqs::config::Builder::new()
+    let sqs_config = SQSConfig::Builder::new()
         .region(Region::new("eu-west-1"))
         .endpoint_url("http://localhost:4566/000000000000/submissions") // Queue URL: Differs from 'list-queues' URL, that one gives error
-        .credentials_provider(aws_sdk_sqs::config::Credentials::new(
-            "some_key_id",  // Access key for LocalStack
+        .credentials_provider(SQSConfig::Credentials::new(
+            "some_key_id",      // Access key for LocalStack
             "some_secret",  // Secret key for LocalStack
             None,               // Optional session token
             None,               // Expiry (optional)
@@ -290,14 +369,14 @@ async fn main() {
         .build();
 
     // Construct the SQS client based on our configuration
-    let sqs_client = aws_sdk_sqs::Client::from_conf(sqs_config);
+    let sqs_client = SQSClient::from_conf(sqs_config);
 
     // Build the configuration for Kinesis
-    let kinesis_config = aws_sdk_kinesis::config::Builder::new()
+    let kinesis_config = KinesisConfig::Builder::new()
         .region(Region::new("eu-west-1"))
         .endpoint_url("http://localhost:4566/") // Kinesis uses the root URL
-        .credentials_provider(aws_sdk_kinesis::config::Credentials::new(
-            "some_key_id",  // Access key for LocalStack
+        .credentials_provider(KinesisConfig::Credentials::new(
+            "some_key_id",      // Access key for LocalStack
             "some_secret",  // Secret key for LocalStack
             None,               // Optional session token
             None,               // Expiry (optional)
@@ -306,7 +385,7 @@ async fn main() {
         .build();
 
     // Construct the Kinesis client based on our configuration
-    let kinesis_client = aws_sdk_kinesis::Client::from_conf(kinesis_config);
+    let kinesis_client = KinesisClient::from_conf(kinesis_config);
 
     // Create a new SubmissionWorker instance
     let worker = SubmissionWorker::new(sqs_client, kinesis_client);
