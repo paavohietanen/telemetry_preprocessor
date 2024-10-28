@@ -1,13 +1,47 @@
-
 use aws_sdk_kinesis::{Client as KinesisClient, config as KinesisConfig, config::Region};
 use aws_sdk_sqs::types::Message;
 use aws_sdk_sqs::{Client as SQSClient, config as SQSConfig};
 use base64::{self, Engine, engine::general_purpose};
 use futures;
-use jsonschema::{self};
+use jsonschema;
 use serde::{Serialize, Deserialize};
+use std::fmt;
 use tokio::time::sleep;
 use tokio::{task, time};
+
+// Custom WorkerError to better control error handling at the point of task spawning
+// e.g. not all errors implement `Send` trait, so they can't be returned from a task
+#[derive(Debug, Clone)]
+pub enum WorkerError {
+    // Error for writing to Kinesis, contains a list of errors due to writing retry
+    WritingError(Vec::<String>),
+    // Error for JSON deserialization
+    JsonDeserializationError(String),
+    // Error for JSON serialization
+    JsonSerializationError(String),
+    // Error for submission validation
+    // Refrain from using ValidationError from jsonschema crate in order to not have to
+    // deal with the lifetime specifier in the error type
+    ValidationError(String),
+    // Error for no body found in submission
+    NoBodyError(String),
+
+}
+
+// Implement Display for WorkerError
+impl fmt::Display for WorkerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorkerError::WritingError(err) => write!(f, "Writing error: {}", err.join(", ")),
+            WorkerError::JsonDeserializationError(err) => write!(f, "JSON deserialization error: {}", err),
+            WorkerError::JsonSerializationError(err) => write!(f, "JSON serialization error: {}", err),
+            WorkerError::ValidationError(err) => write!(f, "Validation error: {}", err),
+            WorkerError::NoBodyError(err) => write!(f, "No body error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for WorkerError {}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Submission {
@@ -77,7 +111,7 @@ fn decode_base64(encoded_data: &str) -> Result<Vec<u8>, base64::DecodeError> {
 }
 
 // Helper function to validate JSON against a schema
-async fn is_valid_submission(json_str: &str) -> bool {
+async fn is_valid_submission(json_str: &str) -> Result<(), WorkerError> {
 
     // Initiate the control schema
     let control_schema = serde_json::json!({
@@ -126,19 +160,17 @@ async fn is_valid_submission(json_str: &str) -> bool {
     // Parse the JSON string to a 'Value' type
     let json_data = match serde_json::from_str(json_str) {
         Ok(json_data) => json_data,
-        Err(error) => {
-            println!("Error parsing JSON to 'Value': {:?}", error);
-            return false;
+        Err(e) => {
+            return Err(WorkerError::JsonDeserializationError(e.to_string()));
         },
     };
 
     // Validate the JSON data against the control schema
-    if jsonschema::is_valid(&control_schema, &json_data) {
-        println!("Valid JSON!");
-        return true;
-    } else {
-        println!("Invalid JSON!");
-        return false;
+    match jsonschema::validate(&control_schema, &json_data) {
+        Ok(_) => return Ok(()),
+        Err(e) => {
+            return Err(WorkerError::ValidationError(e.to_string()));
+        }
     }
 }
 
@@ -177,59 +209,107 @@ impl SubmissionWorker {
                     if let Some(messages) = submission.messages {
                         for message in messages {
                             let processor = self.clone();
-                            // TODO: error handling
+                            let receipt_handle = match message.receipt_handle.clone() {
+                                Some(receipt_handle) => receipt_handle,
+                                None => {
+                                    println!("No receipt handle found");
+                                    continue;
+                                }
+                            };
                             task::spawn(async move {
-                                processor.process_submission(&message).await;
+                                let result = processor.process_submission(&message).await;
+
+                                // If submission was valid but processing fails, release the message back to the queue
+                                if result.is_err() && !matches!(result.clone().unwrap_err(), WorkerError::ValidationError(_)) {
+
+                                    // Log the error
+                                    println!("Error processing submission: {:?}", result.unwrap_err());
+
+                                    // Set the visibility timeout to 0
+                                    match processor.sqs_client
+                                        .change_message_visibility()
+                                        .receipt_handle(receipt_handle)
+                                        .visibility_timeout(0)
+                                        .send()
+                                        .await
+                                        {
+                                            Ok(_) => {
+                                                println!("Message released back to the queue");
+                                            },
+                                            Err(e) => {
+                                                println!("Error changing visibility timeout: {:?}", e);
+                                            }   
+                                    };
+                                }
+
+                                // Invalid and written submissions are deleted from the SQS queue
+                                else {
+                                    // See if ValidationError, and log if yes
+                                    if let Err(e) = result {
+                                        println!("Validation failed: {:?}", e);
+                                    }
+
+                                    // Delete the message from the queue
+                                    match processor.sqs_client
+                                        .delete_message()
+                                        .receipt_handle(receipt_handle)
+                                        .send()
+                                        .await
+                                    {
+                                        Ok(_) => {
+                                            println!("Message deleted from the queue");
+                                        },
+                                        Err(e) => {
+                                            println!("Error deleting message: {:?}", e);
+                                        }
+                                    };
+                                }
                             });
                         }
                     }
                     // sleep for one second
                     sleep(time::Duration::from_secs(1)).await;
                 },
-                Err(error) => {
-                    println!("Error receiving messages: {:?}", error);
+                Err(e) => {
+                    println!("Error receiving messages: {:?}", e);
                 }
             };
         }
     }
 
     // Process submissions function
-    pub async fn process_submission(&self, submission: &Message) {
+    pub async fn process_submission(&self, submission: &Message) -> Result<(), WorkerError> {
         if let Some(body) = &submission.body {
             // Decode the base64 encoded submission
             let decoded_data =  match decode_base64(body) {
                 Ok(decoded_data) => decoded_data,
-                Err(error) => {
-                    println!("Error decoding submission: {:?}", error);
-                    return;
+                Err(e) => {
+                    return Err(WorkerError::ValidationError(e.to_string()));
                 }
             };
 
             // Convert the decoded data to a string
             let submission_str = match String::from_utf8(decoded_data) {
                 Ok(submission_str) => submission_str,
-                Err(error) => {
-                    println!("Error converting submission to string: {:?}", error);
-                    return;
+                Err(e) => {
+                    return Err(WorkerError::ValidationError(e.to_string()));
                 }
             };
 
             // Deserialize the json string to a Submission struct
             let submission: Submission = match serde_json::from_str(&submission_str) {
                 Ok(submission) => submission,
-                Err(error) => {
-                    println!("Error deserializing submission: {:?}", error);
-                    return;
+                Err(e) => {
+                    return Err(WorkerError::ValidationError(e.to_string()));
                 }
             };
 
             // Validate the submission by checking if it matches the expected structure
             match is_valid_submission(&submission_str).await {
-                true => println!("Submission is valid!"),
-                false => {
-                    println!("Submission is invalid!");
-                    return;
-                },
+                Ok(_) => {},
+                Err(e) => {
+                    return Err(e);
+                }
             };
 
             // Create a new vector for events in eventWrappers
@@ -270,14 +350,16 @@ impl SubmissionWorker {
 
             // Start the writing task for current submission
             match &self.handle_writing(events).await {
-                Ok(_) => println!("All events written successfully."),
-                Err(e) => eprintln!("Failed to write events: {:?}", e),
+                Ok(_) => return Ok(()),
+                Err(e) =>
+                    return Err(WorkerError::WritingError(vec![e.to_string()])),
             }
-
+        } else {
+            return Err(WorkerError::NoBodyError("No body found in submission".to_string()));
         }
     }
 
-    async fn handle_writing(&self, events: Vec<EventWrapper>) -> Result<(), Box<dyn std::error::Error>> {
+    async fn handle_writing(&self, events: Vec<EventWrapper>) -> Result<(), WorkerError> {
         // Create futures for all `write` calls
         let futures: Vec<_> = events
             .into_iter()
@@ -288,14 +370,14 @@ impl SubmissionWorker {
         let results = futures::future::join_all(futures).await;
 
         for result in results {
-            if !result { // Check if write was successful
-                return Err("Failed to write event".into());
+            if result.is_err() { // Check if write was successful
+                return Err(result.unwrap_err());
             }
         }
         Ok(())
     }
 
-    async fn write(&self, event: EventWrapper) -> bool {
+    async fn write(&self, event: EventWrapper) -> Result<(), WorkerError> {
 
         // Set the initial retry wait time
         let mut wait_time = tokio::time::Duration::from_secs(1);
@@ -306,9 +388,9 @@ impl SubmissionWorker {
         // Serialize the event to a JSON string
         let json_string = match serde_json::to_string(&event) {
             Ok(s) => s,
-            Err(err) => {
-                println!("Error serializing event: {:?}", err);
-                return false;
+            Err(e) => {
+                println!("Error serializing event: {:?}", e);
+                return Err(WorkerError::JsonSerializationError(e.to_string()));
             }
         };
 
@@ -317,6 +399,9 @@ impl SubmissionWorker {
 
         // Set the shard ID/Partition key
         let shard = "shardId-000000000000";
+
+        // Initiate an array for possible errors
+        let mut errors = Vec::<String>::new();
 
         // Try to write the event to the Kinesis stream
         for attempt in 0..max_retries {
@@ -331,11 +416,13 @@ impl SubmissionWorker {
             match result {
                 Ok(response) => {
                     println!("Put record successful: {:?}", response);
-                    return true; // Success
+                    return Ok(()); // Success
                 }
 
                 // If not successful, log the error and retry
                 Err(err) => {
+                    // Add error to array
+                    errors.push(err.to_string());
                     println!("Error writing event, attempt {}: {:?}", attempt + 1, err);
                     if attempt < max_retries - 1 {
                         sleep(wait_time).await;
@@ -347,7 +434,7 @@ impl SubmissionWorker {
         }
 
         // Failed after maximum number of retries
-        false
+        return Err(WorkerError::WritingError(errors));
     
     }
 }
