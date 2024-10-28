@@ -1,9 +1,13 @@
 use aws_config::imds::client;
 use aws_config::BehaviorVersion;
 use aws_sdk_kinesis::config;
+use aws_sdk_kinesis::error::SdkError;
+use aws_sdk_kinesis::operation::put_record::PutRecordError;
+use aws_sdk_kinesis::types::error;
 use aws_sdk_sqs::types::Message;
 use aws_sdk_sqs::{Client, Config, config::Region};
 use base64::{self, Engine, engine::general_purpose};
+use futures;
 use jsonschema::{self, ValidationError};
 use serde::{Serialize, Deserialize};
 use tokio::time::sleep;
@@ -78,11 +82,10 @@ fn decode_base64(encoded_data: &str) -> Result<Vec<u8>, base64::DecodeError> {
 }
 
 // Helper function to validate JSON against a schema
-async fn validate_json(json_str: &str) -> bool {
+async fn is_valid_submission(json_str: &str) -> bool {
     // Initiate the control schema
-    print!(" === INITIATING SCHEMA === ");
+    println!(" === INITIATING SCHEMA === ");
     let control_schema = serde_json::json!({
-        "$schema": "http://json-schema.org/draft-2020-12/schema",
         "type": "object",
         "properties": {
             "submission_id": { "type": "string" },
@@ -125,15 +128,6 @@ async fn validate_json(json_str: &str) -> bool {
         "required": ["submission_id", "device_id", "time_created", "events"]
     });
 
-    // Initiate schema validator
-    let validator = match jsonschema::validator_for(&control_schema) {
-        Ok(validator) => validator,
-        Err(error) => {
-            println!("Error creating JSON schema validator: {:?}", error);
-            return false;
-        },
-    };
-    println!(" === VALIDATING JSON === ");
     let json_data = match serde_json::from_str(json_str) {
         Ok(json_data) => json_data,
         Err(error) => {
@@ -141,12 +135,13 @@ async fn validate_json(json_str: &str) -> bool {
             return false;
         },
     };
-    match validator.validate(&json_data) {
-        Ok(_) => true,
-        Err(error) => {
-            println!("Validation error: {:?}", error);
-            false
-        }
+
+    if jsonschema::is_valid(&control_schema, &json_data) {
+        println!("Valid JSON!");
+        return true;
+    } else {
+        println!("Invalid JSON!");
+        return false;
     }
 }
 
@@ -158,12 +153,13 @@ async fn validate_json(json_str: &str) -> bool {
 //   the resource for other Processors upon failure
 #[derive(Clone)]
 struct SubmissionWorker {
-    client: Client,
+    sqs_client: aws_sdk_sqs::Client,
+    kinesis_client: aws_sdk_kinesis::Client,
 }
 
 impl SubmissionWorker {
-    pub fn new(client: Client) -> Self {
-        Self { client }
+    pub fn new(sqs_client: aws_sdk_sqs::Client, kinesis_client: aws_sdk_kinesis::Client) -> Self {
+        Self { sqs_client, kinesis_client }
     }
 
     // Main loop for submission processing
@@ -173,7 +169,7 @@ impl SubmissionWorker {
         loop {
             // Read a submission from SQS, spawn a task to process it or log an error
             let result = match self
-                .client
+                .sqs_client
                 .receive_message()
                 .send()
                 .await {
@@ -188,7 +184,7 @@ impl SubmissionWorker {
                         }
                     }
                     // sleep for one second
-                    //sleep(time::Duration::from_secs(1)).await;
+                    sleep(time::Duration::from_secs(1)).await;
                 },
                 Err(error) => {
                     println!("Error receiving messages: {:?}", error);
@@ -208,6 +204,7 @@ impl SubmissionWorker {
                     return;
                 }
             };
+
             // Convert the decoded data to a string
             let submission_str = match String::from_utf8(decoded_data) {
                 Ok(submission_str) => submission_str,
@@ -216,6 +213,7 @@ impl SubmissionWorker {
                     return;
                 }
             };
+
             // Deserialize the json string to a Submission struct
             let submission: Submission = match serde_json::from_str(&submission_str) {
                 Ok(submission) => submission,
@@ -224,9 +222,15 @@ impl SubmissionWorker {
                     return;
                 }
             };
-            //TODO: Json schema validation
+
             // Validate the submission by checking if it matches the expected structure
-            //let is_valid = validate_json(&submission_str).then({print!("Submission is valid: {:?}", is_valid);});
+            match is_valid_submission(&submission_str).await {
+                true => println!("Submission is valid!"),
+                false => {
+                    println!("Submission is invalid!");
+                    return;
+                },
+            };
 
             // Create a new vector for events in eventWrappers
             let mut events = Vec::<EventWrapper>::new();
@@ -258,19 +262,22 @@ impl SubmissionWorker {
                 // Add the event to the events vector
                 events.push(event_wrapper);
             }
-            
+
+            /*match &self.handle_writing(events).await {
+                Ok(_) => println!("All events written successfully."),
+                Err(e) => eprintln!("Failed to write events: {:?}", e),
+            }*/
 
         }
     }
-
 
 }
 
 
 #[tokio::main]
 async fn main() {
-    // Build the configuration that we want to use
-    let config = aws_sdk_sqs::config::Builder::new()
+    // Build the configuration for SQS
+    let sqs_config = aws_sdk_sqs::config::Builder::new()
         .region(Region::new("eu-west-1"))
         .endpoint_url("http://localhost:4566/000000000000/submissions") // Queue URL: Differs from 'list-queues' URL, that one gives error
         .credentials_provider(aws_sdk_sqs::config::Credentials::new(
@@ -282,11 +289,27 @@ async fn main() {
         ))
         .build();
 
-    // Construct the client based on our configuration
-    let client = aws_sdk_sqs::Client::from_conf(config);
+    // Construct the SQS client based on our configuration
+    let sqs_client = aws_sdk_sqs::Client::from_conf(sqs_config);
+
+    // Build the configuration for Kinesis
+    let kinesis_config = aws_sdk_kinesis::config::Builder::new()
+        .region(Region::new("eu-west-1"))
+        .endpoint_url("http://localhost:4566/") // Kinesis uses the root URL
+        .credentials_provider(aws_sdk_kinesis::config::Credentials::new(
+            "some_key_id",  // Access key for LocalStack
+            "some_secret",  // Secret key for LocalStack
+            None,               // Optional session token
+            None,               // Expiry (optional)
+            "localstack",       // Provider name
+        ))
+        .build();
+
+    // Construct the Kinesis client based on our configuration
+    let kinesis_client = aws_sdk_kinesis::Client::from_conf(kinesis_config);
 
     // Create a new SubmissionWorker instance
-    let worker = SubmissionWorker::new(client);
+    let worker = SubmissionWorker::new(sqs_client, kinesis_client);
 
     // Run the worker
     worker.run().await;
