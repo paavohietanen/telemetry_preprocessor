@@ -2,6 +2,7 @@ use aws_sdk_kinesis::{
     Client as KinesisClient, 
     config as KinesisConfig,
     config::Region,
+    error::SdkError,
     types::{Shard, ShardIteratorType},
     operation::put_record::PutRecordError
 };
@@ -18,9 +19,11 @@ use std::{
     sync::Arc,
     time::SystemTime
 };
+use num_bigint::{BigInt, BigUint};
+use num_traits::Zero;
 
 const MAX_CAPACITY: f64 = 1_000_000.0; // 1 MB/s capacity of a shard
-const SPLIT_THRESHOLD: f64 = 0.0002; // 80% threshold
+const SPLIT_THRESHOLD: f64 = 0.8; // 80% threshold
 const MERGE_THRESHOLD: f64 = 0.3; // 30% threshold
 const MONITORING_DURATION: u64 = 10; // Last 10 seconds for monitoring
 const ENTRY_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60); // 60 seconds
@@ -33,6 +36,9 @@ struct ShardMetrics {
     // Starting hash key of the shard
     // Needed in shard splitting and merging
     starting_hash_key: String,
+    // Ending hash key of the shard
+    // Needed in shard merging
+    ending_hash_key: String,
     // Average data processed per entry over TrafficMonitor's
     // observation duration
     average_data_processed: f64,
@@ -69,20 +75,9 @@ impl ShardDataStore {
         self.shards.push(shard);
     }
 
-    // Modify an existing shard
-    pub fn modify_shard(&mut self, shard_id: String, new_shard_data: ShardMetrics) {
-        // Find the shard in the shards vector
-        let shard = self.shards.iter_mut().find(|s| s.shard_id == shard_id);
-
-        // If the shard is found, update it
-        if let Some(shard) = shard {
-            *shard = new_shard_data;
-        }
-    }
-
-    // Check if a shard exists
-    pub fn shard_exists(&self, shard_id: String) -> bool {
-        self.shards.iter().any(|s| s.shard_id == shard_id)
+    // Check if shard is active
+    pub fn shard_is_active(&self, shard_id: String) -> bool {
+        self.shards.iter().find(|s| s.shard_id == shard_id).map(|s| s.is_active).unwrap_or(false)
     }
 
     // Get shard by id
@@ -90,18 +85,26 @@ impl ShardDataStore {
         self.shards.iter().find(|s| s.shard_id == shard_id).map(|s| s.clone())
     }
 
+    // Get shard for modification
+    pub fn get_shard_by_id_mut(&mut self, shard_id: String) -> Option<&mut ShardMetrics> {
+        self.shards.iter_mut().find(|s| s.shard_id == shard_id)
+    }
+
     // Get shard
-    pub fn get_shard(&self) -> Result<String, WorkerError> {
-        // Make a new list and fill it with shard with least amount of submissions
+    pub fn get_healthiest_shard(&self) -> Result<String, WorkerError> {
+        // Make a new list and fill it with active shards with least amount of submissions
         let mut shards_with_least_submissions = Vec::new();
         let mut min_submissions = std::usize::MAX;
+        //Keep only shards that have is_active == true
         for shard in &self.shards {
-            if shard.submissions.len() < min_submissions {
-                min_submissions = shard.submissions.len();
-                shards_with_least_submissions.clear();
-                shards_with_least_submissions.push(shard);
-            } else if shard.submissions.len() == min_submissions {
-                shards_with_least_submissions.push(shard);
+            if shard.is_active {
+                if shard.submissions.len() < min_submissions {
+                    min_submissions = shard.submissions.len();
+                    shards_with_least_submissions.clear();
+                    shards_with_least_submissions.push(shard);
+                } else if shard.submissions.len() == min_submissions {
+                    shards_with_least_submissions.push(shard);
+                }
             }
         }
 
@@ -131,7 +134,6 @@ impl ShardDataStore {
         // If the shard is found, add the submission id
         if let Some(shard) = shard {
             shard.submissions.push(submission_id.to_string());
-            println!("Submission {} added to shard {}", submission_id, shard_id);
         }
     }
 
@@ -161,19 +163,8 @@ impl ShardDataStore {
                 records_read: record_count,
             });
         } else {
-            // If the shard is not found, create a new entry
-            self.shards.push(ShardMetrics {
-                shard_id: shard_id.to_string(),
-                average_data_processed: 0.0,
-                starting_hash_key: "".to_string(),
-                entries: vec![ShardMetricEntry {
-                    timestamp: SystemTime::now(),
-                    data_processed: data_size,
-                    records_read: record_count,
-                }],
-                submissions: Vec::new(),
-                is_active: true,
-            });
+            // If the shard is not found, create a new entry, print an error
+            println!("Shard {} not found", shard_id);
         }        
     }
            
@@ -182,8 +173,6 @@ impl ShardDataStore {
 struct TrafficMonitor {
     // Kinesis client to fetch shards
     kinesis_client: aws_sdk_kinesis::Client,
-    high_traffic_threshold: f64, // e.g., 0.8 for 80%
-    low_traffic_threshold: f64, // e.g., 0.3 for 30%
     // Interval for the monitoring loop
     check_interval: tokio::time::Duration,
     // ShardDataStore for managing traffic data
@@ -196,8 +185,6 @@ impl TrafficMonitor {
     pub fn new(kinesis_client: aws_sdk_kinesis::Client, check_interval: tokio::time::Duration, shard_data: Arc<RwLock<ShardDataStore>>) -> Self {
         Self {
             kinesis_client,
-            high_traffic_threshold: 0.8,
-            low_traffic_threshold: 0.3,
             check_interval,
             shard_data,
         }
@@ -277,14 +264,13 @@ impl TrafficMonitor {
                                     false => {
                                         { // Acquire write lock to update the shard
                                             let mut shard_data = self.shard_data.write().await;
-                                            shard_data.modify_shard(shard.shard_id.clone(), ShardMetrics {
-                                                shard_id: existing_shard.shard_id,
-                                                starting_hash_key: existing_shard.starting_hash_key,
-                                                average_data_processed: existing_shard.average_data_processed,
-                                                entries: existing_shard.entries,
-                                                submissions: existing_shard.submissions,
-                                                is_active,
-                                            });
+                                            
+                                            // Get the shard from the shard data store
+                                            let inactive_shard = shard_data.get_shard_by_id_mut(shard.shard_id.clone()).unwrap();
+
+                                            // Set the shard to inactive
+                                            inactive_shard.is_active = is_active;
+                                            println!("-------------------------- Shard {} activity status updated to {:?}", shard.shard_id, is_active);
                                         } // Release the write lock
                                     }
                                 }
@@ -296,6 +282,10 @@ impl TrafficMonitor {
                                         shard_id: shard.shard_id.clone(),
                                         starting_hash_key: match &shard.hash_key_range {
                                             Some(range) =>  range.starting_hash_key().to_string(),
+                                            None => return Err(WorkerError::ValidationError("Hash key range not found".to_string())),
+                                        },
+                                        ending_hash_key: match &shard.hash_key_range {
+                                            Some(range) =>  range.ending_hash_key().to_string(),
                                             None => return Err(WorkerError::ValidationError("Hash key range not found".to_string())),
                                         },
                                         average_data_processed: 0.0,
@@ -401,6 +391,11 @@ impl TrafficMonitor {
         for shard_id in shards_to_split {
             self.split_shard(&shard_id).await;
         }
+
+        // If there are two or more mergeable shards, merge them
+        if shards_to_merge.len() >= 2 {
+            self.handle_merging(shards_to_merge).await;
+        }
     }
 
     async fn split_shard(&mut self, shard_id: &String) {
@@ -419,9 +414,14 @@ impl TrafficMonitor {
                     return;
                 },
             };
-            // Clone the shard's starting hash key to a new variable
-            // This is the starting hash key of the other resulting shard during the split
-            new_starting_hash_key = shard.starting_hash_key;
+            // Calculate the new starting hash key
+            new_starting_hash_key = match Self::calculate_new_starting_hash_key(&shard.starting_hash_key, &shard.ending_hash_key) {
+                Ok(key) => key,
+                Err(e) => {
+                    println!("Error calculating new starting hash key: {:?}", e);
+                    return;
+                },
+            };
         }
     
         let split_result = self.kinesis_client
@@ -443,23 +443,157 @@ impl TrafficMonitor {
             Err(e) => println!("Error updating shard data store: {:?}", e),
         }
     }
-    /*
-    async fn merge_shard(&mut self, shard_id: &String) {
-        // Use the Kinesis client to merge the shard with its adjacent shard
+
+    fn calculate_new_starting_hash_key(original_starting_hash_key: &str, original_ending_hash_key: &str) -> Result<String, WorkerError> {
+        // Convert the hash keys from strings to u64 (or any other numeric type as needed)
+        let starting_key: BigInt = match original_starting_hash_key.parse::<BigInt>() {
+            Ok(key) => key,
+            Err(_) => {print!("ERROR PARSING STARTING KEY");
+                return Err(WorkerError::ValidationError("Error parsing starting key".to_string()));
+            }
+            ,
+        };
+        println!("Starting key: {:?}", starting_key);
+        println!("Ending key: {:?}", original_ending_hash_key);
+        let ending_key: BigInt = match original_ending_hash_key.parse::<BigInt>() {
+            Ok(key) => key,
+            Err(_) => {print!("ERROR PARSING ENDING KEY");
+                return Err(WorkerError::ValidationError("Error parsing ending key".to_string()))}
+        };
     
+        // Calculate the midpoint (this is the new starting hash key for one of the split shards)
+        let new_starting_key: BigInt = (starting_key + ending_key) / 2;
+    
+        // Convert back to string
+        Ok(new_starting_key.to_string())
+    }
+    
+    // Function to merge a list of shards in pairs
+    pub async fn handle_merging(&mut self, mergable_ids: Vec<String>) -> Result<(), WorkerError> {
+
+        // Initialize a vector for objects that were merged
+        let mut merged_shards: Vec<String> = Vec::new();
+        println!("%%%%%%%%%%%%%%%%%%%%%%%%% Merging shards...");
+        // Initialize a vector for corresponding SharedMetrics objects
+        let mut shards: Vec<ShardMetrics> = Vec::new();
+        { // Acquire a read lock
+            let shard_data = self.shard_data.read().await;
+            // Get the ShardMetrics objects for the shards
+            for shard_id in &mergable_ids {
+                if let Some(shard) = shard_data.get_shard_by_id(shard_id.clone()) {
+                    shards.push(shard);
+                }
+            }
+        } // Release the read lock
+
+        // Iterate through the shards
+        for i in 0..shards.len() {
+            // Check if the shard can be merged
+            if shards[i].is_active {
+                // Check for a pair to merge with
+                for j in (i + 1)..shards.len() {
+                    println!(" %%%%% ACTIVITY SHARD i {:?} {:?} SHARD j {:?} {:?}", shards[i].shard_id, shards[i].is_active, shards[j].shard_id, shards[j].is_active);
+                    if shards[j].is_active && Self::is_adjacent(&shards[i], &shards[j]) {
+                        println!("%%%%%%%%%%%%%%%%%%%%%%%%% Merging shards: {:?} {:?}", shards[i].shard_id, shards[j].shard_id);
+                        let merge_result = &self.merge_shard(&shards[i].shard_id, &shards[j].shard_id).await;
+
+                        if merge_result.is_ok() {
+                            println!(" &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& SUCCESSFUL MERGE &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&");
+                            // Add the merged shards to the list
+                            merged_shards.push(shards[i].shard_id.clone());
+                            merged_shards.push(shards[j].shard_id.clone());
+
+                            // Break out of the inner loop after merging
+                            break;
+                        }
+                    }
+                    else {
+                        println!("%%%%%%%%%%%%%%%%%%%%%%%%% Shards {:?} and {:?} are not adjacent, or other is not active", shards[i].shard_id, shards[j].shard_id);
+                    }
+                }
+            }
+        }
+        // Loop through the merged shards and set their activity to false
+        for shard_id in merged_shards {
+            { // Acquire a write lock
+                let mut shard_data = self.shard_data.write().await;
+                let shard = match shard_data.get_shard_by_id_mut(shard_id.clone()) {
+                    Some(s) => s,
+                    None => {
+                        println!("Shard {} not found", shard_id);
+                        return Err(WorkerError::ValidationError("Shard not found".to_string()));
+                    },
+                };
+                shard.is_active = false;
+            } // Release the write lock
+        };
+
+        println!("%%%%%%%%%%%%%%%%%%%%%%%%% Exiting merging loop");
+        Ok(())
+    }
+
+    // Check to see if shards are adjacent
+    fn is_adjacent(shard_a: &ShardMetrics, shard_b: &ShardMetrics) -> bool {
+        // Check if the end of shard_a matches the start of shard_b
+        println!(" ¤¤¤¤¤¤¤¤¤¤ END SHARD i {:?} START SHARD j {:?}", shard_a.ending_hash_key, shard_b.starting_hash_key);
+        println!(" ¤¤¤¤¤¤¤¤¤¤ END SHARD j {:?} START SHARD i {:?}", shard_b.ending_hash_key, shard_a.starting_hash_key);
+        // First parse both keys to BigInt
+        let starting_key_a = match shard_a.starting_hash_key.parse::<BigInt>() {
+            Ok(key) => key,
+            Err(_) => {
+                println!("Error parsing starting key A");
+                return false;
+            }
+        };
+        let ending_key_a = match shard_a.ending_hash_key.parse::<BigInt>() {
+            Ok(key) => key,
+            Err(_) => {
+                println!("Error parsing ending key A");
+                return false;
+            }
+        };
+        let starting_key_b = match shard_b.starting_hash_key.parse::<BigInt>() {
+            Ok(key) => key,
+            Err(_) => {
+                println!("Error parsing starting key B");
+                return false;
+            }
+        };
+        let ending_key_b = match shard_b.ending_hash_key.parse::<BigInt>() {
+            Ok(key) => key,
+            Err(_) => {
+                println!("Error parsing ending key B");
+                return false;
+            }
+        };
+        let is_adjacent = ending_key_a + 1 == starting_key_b
+            || ending_key_b + 1 == starting_key_a;
+        
+        println!(" ¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤ IS ADJACENT {:?}", is_adjacent);
+        is_adjacent
+    }
+
+    async fn merge_shard(&mut self, shard_id_1: &String, shard_id_2: &String) -> Result<(), WorkerError> {
+        // Use the Kinesis client to merge the shard with its adjacent shard
         let merge_result = self.kinesis_client
             .merge_shards()
-            .stream_name("your_stream_name")
-            .shard_to_merge(shard.shard_id.clone())
-            .adjacent_shard_to_merge("adjacent_shard_id") // Define your adjacent shard
+            .stream_name("events")
+            .shard_to_merge(shard_id_1.clone())
+            .adjacent_shard_to_merge(shard_id_2.clone()) // Define your adjacent shard
             .send()
             .await;
     
         match merge_result {
-            Ok(_) => println!("Successfully merged shard: {:?}", shard_id),
-            Err(err) => println!("Error merging shard: {:?}", err),
+            Ok(_) => {
+                println!("Successfully merged shards: {:?} {:?}", shard_id_1, shard_id_2);
+                Ok(())
+            },
+            Err(err) => {
+                println!("Error merging shard: {:?}", err);
+                Err(WorkerError::WritingError(vec![err.to_string()]))
+            },
         }
-    }*/
+    }
 
 }
 
@@ -818,21 +952,28 @@ impl SubmissionWorker {
     }
 
     async fn handle_writing(&self, events: Vec<EventWrapper>) -> Result<(), WorkerError> {
-        println!("Writing events to Kinesis...");
         // Clone the id of this submission to a new variable
         let submission_id = &events[0].submission_id.clone();
 
+        // Initiate a variable for shard id
+        let shard_id: String;
         { // Acquire write lock on `shard_data`
             let mut shard_data = self.shard_data.write().await;
 
+            // Get the healthiest shard to write to
+            shard_id = match shard_data.get_healthiest_shard() {
+                Ok(id) => id,
+                Err(e) => return Err(e),
+            };
+
             // Add this submission to the shard_data to note that it is being written on it
-            shard_data.add_submission("shardId-000000000000", &submission_id);
+            shard_data.add_submission(&shard_id, &submission_id);
         } // Release the write lock
 
         // Create futures for all `write` calls
         let futures: Vec<_> = events
             .into_iter()
-            .map(|event| self.write(event, "shardId-000000000000".to_string()))
+            .map(|event| self.write(event, shard_id.clone()))
             .collect();
 
         // Await all futures concurrently
@@ -842,7 +983,7 @@ impl SubmissionWorker {
             let mut shard_data = self.shard_data.write().await;
 
             // Delete the submission from the shard_data
-            shard_data.remove_submission("shardId-000000000000", &submission_id);
+            shard_data.remove_submission(&shard_id, &submission_id);
         } // Release the write lock
 
         for result in results {
@@ -910,36 +1051,32 @@ impl SubmissionWorker {
                 Err(err) => {
                     // Add error to array
                     errors.push(err.to_string());
-                    println!("Error writing event, attempt {}: {:?}", attempt + 1, err);
+                    //println!("Error writing event, attempt {}: {:?}", attempt + 1, err);
 
-                    // Wait for the retry time
-                    tokio::time::sleep(wait_time).await;
-                    
-                    // Double the wait time for the next retry
-                    // In order to let possible congestion clear
-                    wait_time *= 2;
-
-                    // Check if the error indicates that the shard ID is invalid (e.g., shard has been split)
-                    // todo: implement error handling when known what is the correct error code for shard having been split
-                    /*match err {
+                    // Match against the error type and react accordingly
+                    match err {
                         SdkError::ServiceError(service_err) => {
-                            // Here, `service_err` is of type `ServiceError<PutRecordError, Response>`
-                            
                             // We need to extract the PutRecordError from the ServiceError
                             let put_record_error = service_err.err(); // The service_err itself is the error we need
                             
                             // Match against the PutRecordError variants
                             match put_record_error {
                                 PutRecordError::ProvisionedThroughputExceededException(e) => {
-                                    // Handle transient error: Implement retry logic
-                                    println!("Provisioned throughput exceeded.");
-                                }
-                                PutRecordError::KmsDisabledException(_) => {
-                                    // Handle case where the shard does not exist anymore
-                                    println!("Shard not found. Need to retrieve a new shard ID.");
-                                    // Retrieve new shard ID and retry logic goes here
+                                    // Rate has exceeded for this shard, get a new shard for the next attempt
+                                    println!("ProvisionedThroughputExceededException occurred: {:?}", e);
+                                    { // Acquire a read lock
+                                        let shard_data = self.shard_data.read().await;
+                                        // Get a new shard
+                                        shard_id = match shard_data.get_healthiest_shard() {
+                                            Ok(id) => id.clone(), // Clone the id to return it
+                                            Err(e) => return Err(e.clone()),
+                                        };
+                                        println!("New shard ID: {}", shard_id);
+                                    } // Release the read lock
+                                    println!("Retrying with shard {}", shard_id);
                                 }
                                 // Handle other specific PutRecordError cases if needed
+                                // Todo: Implement logic
                                 _ => {
                                     // Log or handle other types of errors
                                     println!("Other PutRecordError occurred: {:?}", put_record_error);
@@ -948,13 +1085,23 @@ impl SubmissionWorker {
                         }
                         SdkError::TimeoutError(_) => {
                             // Handle timeout errors
+                            // Todo: Implement logic
                             println!("Request timed out.");
                         }
                         _ => {
                             // Handle other generic errors
+                            // Todo: Implement logic
                             println!("An unexpected error occurred: {:?}", err);
                         }
-                    }*/
+                    }
+
+                    
+                    // Wait for the retry time
+                    tokio::time::sleep(wait_time).await;
+                    
+                    // Double the wait time for the next retry
+                    // In order to let possible congestion clear
+                    wait_time *= 2;
                 }
             }
         }
@@ -969,11 +1116,11 @@ impl SubmissionWorker {
         { // Acquire read lock
             let shard_data = self.shard_data.read().await; 
 
-            // Check if the shard exists
-            if !shard_data.shard_exists(shard_id.clone()) {
+            // Check if the shard is active
+            if !shard_data.shard_is_active(shard_id.clone()) {
 
                 // If shard doesn't exist anymore, get a new shard
-                let new_shard_id = match shard_data.get_shard() {
+                let new_shard_id = match shard_data.get_healthiest_shard() {
                     Ok(id) => id.clone(), // Clone the id to return it
                     Err(e) => return Err(e.clone()),
                 };
