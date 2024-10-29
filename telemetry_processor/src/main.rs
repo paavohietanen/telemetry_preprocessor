@@ -1,4 +1,4 @@
-use aws_sdk_kinesis::{Client as KinesisClient, config as KinesisConfig, config::Region};
+use aws_sdk_kinesis::{Client as KinesisClient, config as KinesisConfig, config::Region, types::{Shard, ShardIteratorType}};
 use aws_sdk_sqs::types::Message;
 use aws_sdk_sqs::{Client as SQSClient, config as SQSConfig};
 use base64::{self, Engine, engine::general_purpose};
@@ -7,7 +7,286 @@ use jsonschema;
 use serde::{Serialize, Deserialize};
 use std::fmt;
 use tokio::time::sleep;
-use tokio::{task, time};
+use tokio::{task, time, sync::RwLock};
+use std::{
+    sync::Arc,
+    time::SystemTime
+};
+
+const MAX_CAPACITY: f64 = 1_000_000.0; // 1 MB/s capacity of a shard
+const SPLIT_THRESHOLD: f64 = 0.8; // 80% threshold
+const MERGE_THRESHOLD: f64 = 0.3; // 30% threshold
+const MONITORING_DURATION: u64 = 10; // Last 10 seconds for monitoring
+const ENTRY_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60); // 60 seconds
+
+// ShardMetrics struct to hold metrics for each shard
+#[derive(Debug, Clone)]
+struct ShardMetrics {
+    shard_id: String,
+    average_data_processed: f64,
+    entries: Vec<ShardMetricEntry>,
+}
+
+// A single entry of shard data
+#[derive(Debug, Clone)]
+struct ShardMetricEntry {
+    timestamp: SystemTime,
+    data_processed: u64,
+    records_read: u64,
+}
+
+struct ShardDataStore {
+    shards: Vec<ShardMetrics>,
+}
+
+impl ShardDataStore {
+    pub fn new() -> Self {
+        Self {
+            shards: Vec::new(),
+        }
+    }
+
+    // Function to fetch shards and create ShardMetrics based on them
+    pub async fn init(&mut self, shard_ids: Vec<String>) {
+
+        // Create ShardMetrics for each shard
+        for shard_id in shard_ids {
+            self.shards.push(ShardMetrics {
+                shard_id,
+                average_data_processed: 0.0,
+                entries: Vec::new(),
+            });
+        }
+    }
+
+    // Init a single new shard
+    pub fn add_shard(&mut self, shard_id: String) {
+        self.shards.push(ShardMetrics {
+            shard_id,
+            average_data_processed: 0.0,
+            entries: Vec::new(),
+        });
+    }
+
+    // Function to record metrics data for the traffic monitor
+    // Currently only stores written bytes and records
+    pub async fn record_metrics(&mut self, shard_id: &str, data_size: u64, record_count: u64) {
+        // Find the shard in the shards vector
+        let shard = self.shards.iter_mut().find(|s| s.shard_id == shard_id);
+
+        // If the shard is found, update the metrics
+        if let Some(shard) = shard {
+            shard.entries.push(ShardMetricEntry {
+                timestamp: SystemTime::now(),
+                data_processed: data_size,
+                records_read: record_count,
+            });
+        } else {
+            // If the shard is not found, create a new entry
+            self.shards.push(ShardMetrics {
+                shard_id: shard_id.to_string(),
+                average_data_processed: 0.0,
+                entries: vec![ShardMetricEntry {
+                    timestamp: SystemTime::now(),
+                    data_processed: data_size,
+                    records_read: record_count,
+                }],
+            });
+        }        
+    }
+           
+}
+
+struct TrafficMonitor {
+    kinesis_client: aws_sdk_kinesis::Client,
+    high_traffic_threshold: f64, // e.g., 0.8 for 80%
+    low_traffic_threshold: f64, // e.g., 0.3 for 30%
+    check_interval: tokio::time::Duration,
+    // A shared resource between Monitor and Workers
+    shard_data: Arc<RwLock<ShardDataStore>>,
+}
+
+impl TrafficMonitor {
+
+    pub fn new(kinesis_client: aws_sdk_kinesis::Client, check_interval: tokio::time::Duration, shard_data: Arc<RwLock<ShardDataStore>>) -> Self {
+        Self {
+            kinesis_client,
+            high_traffic_threshold: 0.8,
+            low_traffic_threshold: 0.3,
+            check_interval,
+            shard_data,
+        }
+    }
+
+    // Function to start monitoring traffic
+    pub async fn start_monitoring(&mut self) {
+
+        // First initiate the shard data storage
+        self.init_shard_data().await;
+
+        // Start the monitoring loop
+        println!("Starting traffic monitoring...");
+        loop {
+            // Check traffic conditions
+            self.manage_traffic().await;
+            tokio::time::sleep(self.check_interval).await;
+        };
+    }
+
+    // Init the shard data storage
+    pub async fn init_shard_data(&mut self) {
+        // Fetch all shards from the Kinesis stream
+        let shard_ids = self.fetch_shards().await;
+
+        // Acquire a write lock on `shard_data`
+        let mut shard_data = self.shard_data.write().await;
+
+        // Create ShardMetrics for each shard
+        shard_data.init(shard_ids).await;
+    }
+
+    // Fetch all shards from the Kinesis stream
+    async fn fetch_shards(&self) -> Vec<String> {
+        // Initiate a new list for shard IDs
+        let mut shard_ids = Vec::new();
+
+        // Kinesis might return the shards in multiple responses
+        // To get all subsets of shards, we need a marker from where to start
+        // retrieving the next batch of shards, if any left.
+        // Initialize this first to None, to start from the beginning
+        let mut next_token: Option<String> = None;
+
+        // Loop to handle paginated results
+        loop {
+            // Describe the stream to get shard information
+            let mut request = self.kinesis_client.describe_stream()
+            .stream_name("events"); // Stream name
+
+            // Only add exclusive_start_shard_id if next_token is Some
+            if let Some(ref token) = next_token {
+                request = request.exclusive_start_shard_id(token); // Use token directly
+            }
+
+            // Send the request and await the response
+            let response = request.send().await;
+
+            match response {
+                Ok(ref res) => {
+                    if let Some(ref description) = res.stream_description {
+                        // Append the shard IDs to the list
+                        for shard in &description.shards {
+                            shard_ids.push(shard.shard_id.clone());
+                        }
+                        
+                        // Function .last() returns the last element of the iterator, or None, if there are no elements
+                        // If there is a last shard, map() takes the last shard `s` and returns the clone of its shard_id
+                        next_token = description.shards.last().map(|s| s.shard_id.clone());
+                    }
+
+                    // Break the loop if there are no more shards to process
+                    if next_token.is_none() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    println!("Error fetching shards: {:?}", err);
+                    break; // Handle the error as appropriate for your application
+                }
+            }
+        }
+
+        shard_ids
+    }
+
+    
+    // Function to check traffic and manage shards
+    pub async fn manage_traffic(&mut self) {
+        let current_time = SystemTime::now();
+
+        // Acquire a write lock on `shard_data`
+        let mut shard_data = self.shard_data.write().await;
+
+        // Iterate through shards
+        for mut metrics in shard_data.shards.clone() {
+
+            // Remove entries older than ENTRY_LIFETIME
+            metrics.entries.retain(|entry| {
+                current_time.duration_since(entry.timestamp).map_or(false, |elapsed| {
+                    elapsed <= ENTRY_LIFETIME
+                })
+            });
+            // Calculate the average data processed per second from all entries that
+            // fall to the monitoring duration
+            let mut total_data_processed: f64 = 0.0;
+            let mut number_of_entries: u64 = 0;
+            // Iterate through shard metrics
+            for entry in &metrics.entries {
+            
+                // Check if the metrics were recorded in the last 10 seconds
+                if let Ok(elapsed) = current_time.duration_since(entry.timestamp) {
+
+                    if elapsed.as_secs() <= MONITORING_DURATION {
+                        // Add the data processed to the total
+                        total_data_processed += entry.data_processed as f64;
+                        number_of_entries += 1;
+                        // Calculate the percentage of capacity used
+                        let usage_percentage = (entry.data_processed as f64) / MAX_CAPACITY * 100.0;
+
+                        // If the usage percentage exceeds the threshold, split the shard
+                        if usage_percentage >= SPLIT_THRESHOLD * 100.0 {
+                            println!("Shard {} is over 80% capacity, splitting...", metrics.shard_id);
+                            //self.split_shard(&metrics.shard_id).await;
+                        }
+
+                        // If the usage percentage is below or equal to the merge threshold, merge the shard
+                        if usage_percentage <= MERGE_THRESHOLD * 100.0 {
+                            println!("Shard {} is below or equal to 30% capacity, merging...", metrics.shard_id);
+                            //self.merge_shard(&metrics.shard_id).await; // Assuming you have a merge_shard method
+                        }
+                    }
+                }
+            }
+            metrics.average_data_processed = total_data_processed / number_of_entries as f64;
+            println!(" ========= Shard {} average data processed: {}", metrics.shard_id, metrics.average_data_processed);
+        }
+    }
+}
+
+/*    async fn split_shard(&mut self, shard_id: &String) {
+        // Use the Kinesis client to split the shard
+        // Tie the new shard to a given UUID
+    
+        let split_result = self.kinesis_client
+            .split_shard()
+            .stream_name("events")
+            .shard_to_split(shard_id.clone())
+            .new_starting_hash_key("new_hash_key") // Define your hash key
+            .send()
+            .await;
+    
+        match split_result {
+            Ok(_) => println!("Successfully split shard: {:?}", shard_id),
+            Err(err) => println!("Error splitting shard: {:?}", err),
+        }
+    }
+    
+    async fn merge_shard(&mut self, shard_id: &String) {
+        // Use the Kinesis client to merge the shard with its adjacent shard
+    
+        let merge_result = self.kinesis_client
+            .merge_shards()
+            .stream_name("your_stream_name")
+            .shard_to_merge(shard.shard_id.clone())
+            .adjacent_shard_to_merge("adjacent_shard_id") // Define your adjacent shard
+            .send()
+            .await;
+    
+        match merge_result {
+            Ok(_) => println!("Successfully merged shard: {:?}", shard_id),
+            Err(err) => println!("Error merging shard: {:?}", err),
+        }
+    }
+} */
 
 // Custom WorkerError to better control error handling at the point of task spawning
 // e.g. not all errors implement `Send` trait, so they can't be returned from a task
@@ -188,11 +467,14 @@ struct SubmissionWorker {
 
     // Kinesis client for writing events
     kinesis_client: aws_sdk_kinesis::Client,
+
+    // Shard data store
+    shard_data: Arc<RwLock<ShardDataStore>>,
 }
 
 impl SubmissionWorker {
-    pub fn new(sqs_client: aws_sdk_sqs::Client, kinesis_client: aws_sdk_kinesis::Client) -> Self {
-        Self { sqs_client, kinesis_client }
+    pub fn new(sqs_client: aws_sdk_sqs::Client, kinesis_client: aws_sdk_kinesis::Client, shard_data: Arc<RwLock<ShardDataStore>>) -> Self {
+        Self { sqs_client, kinesis_client, shard_data }
     }
 
     // Main loop for submission processing
@@ -474,8 +756,20 @@ async fn main() {
     // Construct the Kinesis client based on our configuration
     let kinesis_client = KinesisClient::from_conf(kinesis_config);
 
+    // Create a new, shared ShardDataStore instance using tokio::sync::RWLock
+    let shard_data = Arc::new(RwLock::new(ShardDataStore::new()));
+
+
+    // Create a new TrafficMonitor instance
+    let mut monitor = TrafficMonitor::new(kinesis_client.clone(), time::Duration::from_secs(10), shard_data.clone());
+
+    // Start monitoring traffic
+    tokio::spawn(async move {
+        monitor.start_monitoring().await;
+    });
+
     // Create a new SubmissionWorker instance
-    let worker = SubmissionWorker::new(sqs_client, kinesis_client);
+    let worker = SubmissionWorker::new(sqs_client, kinesis_client, Arc::new(RwLock::new(ShardDataStore::new())));
 
     // Run the worker
     worker.run().await;
