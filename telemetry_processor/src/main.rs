@@ -201,6 +201,7 @@ impl TrafficMonitor {
     
     // Function to check traffic and manage shards
     pub async fn manage_traffic(&mut self) {
+        println!(" === Checking traffic conditions...");
         let current_time = SystemTime::now();
 
         // Acquire a write lock on `shard_data`
@@ -208,9 +209,11 @@ impl TrafficMonitor {
 
         // Iterate through shards
         for mut metrics in shard_data.shards.clone() {
+            println!(" ====== Checking shard {}", metrics.shard_id);
 
             // Remove entries older than ENTRY_LIFETIME
             metrics.entries.retain(|entry| {
+                println!(" ====== Shard {} entry timestamp: {:?}", metrics.shard_id, entry.timestamp);
                 current_time.duration_since(entry.timestamp).map_or(false, |elapsed| {
                     elapsed <= ENTRY_LIFETIME
                 })
@@ -221,7 +224,7 @@ impl TrafficMonitor {
             let mut number_of_entries: u64 = 0;
             // Iterate through shard metrics
             for entry in &metrics.entries {
-            
+                println!(" ====== Shard {} data processed: {}", metrics.shard_id, entry.data_processed);
                 // Check if the metrics were recorded in the last 10 seconds
                 if let Ok(elapsed) = current_time.duration_since(entry.timestamp) {
 
@@ -251,42 +254,6 @@ impl TrafficMonitor {
         }
     }
 }
-
-/*    async fn split_shard(&mut self, shard_id: &String) {
-        // Use the Kinesis client to split the shard
-        // Tie the new shard to a given UUID
-    
-        let split_result = self.kinesis_client
-            .split_shard()
-            .stream_name("events")
-            .shard_to_split(shard_id.clone())
-            .new_starting_hash_key("new_hash_key") // Define your hash key
-            .send()
-            .await;
-    
-        match split_result {
-            Ok(_) => println!("Successfully split shard: {:?}", shard_id),
-            Err(err) => println!("Error splitting shard: {:?}", err),
-        }
-    }
-    
-    async fn merge_shard(&mut self, shard_id: &String) {
-        // Use the Kinesis client to merge the shard with its adjacent shard
-    
-        let merge_result = self.kinesis_client
-            .merge_shards()
-            .stream_name("your_stream_name")
-            .shard_to_merge(shard.shard_id.clone())
-            .adjacent_shard_to_merge("adjacent_shard_id") // Define your adjacent shard
-            .send()
-            .await;
-    
-        match merge_result {
-            Ok(_) => println!("Successfully merged shard: {:?}", shard_id),
-            Err(err) => println!("Error merging shard: {:?}", err),
-        }
-    }
-} */
 
 // Custom WorkerError to better control error handling at the point of task spawning
 // e.g. not all errors implement `Send` trait, so they can't be returned from a task
@@ -698,6 +665,15 @@ impl SubmissionWorker {
             match result {
                 Ok(response) => {
                     println!("Put record successful: {:?}", response);
+
+                    // Record metrics for the traffic monitor
+                    // Acquire a write lock on `shard_data`
+                    let mut shard_data = self.shard_data.write().await;
+
+                    // Record the amount of bytes written to the shard
+                    shard_data.record_metrics(shard, json_string.as_bytes().len() as u64, 1).await;
+
+                    // Return Ok
                     return Ok(()); // Success
                 }
 
@@ -761,7 +737,7 @@ async fn main() {
 
 
     // Create a new TrafficMonitor instance
-    let mut monitor = TrafficMonitor::new(kinesis_client.clone(), time::Duration::from_secs(10), shard_data.clone());
+    let mut monitor = TrafficMonitor::new(kinesis_client.clone(), time::Duration::from_secs(5), shard_data.clone());
 
     // Start monitoring traffic
     tokio::spawn(async move {
@@ -769,7 +745,7 @@ async fn main() {
     });
 
     // Create a new SubmissionWorker instance
-    let worker = SubmissionWorker::new(sqs_client, kinesis_client, Arc::new(RwLock::new(ShardDataStore::new())));
+    let worker = SubmissionWorker::new(sqs_client, kinesis_client, shard_data.clone());
 
     // Run the worker
     worker.run().await;
