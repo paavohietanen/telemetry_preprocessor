@@ -1,11 +1,13 @@
 # Telemetry Processor
 
+
 ## Table of Contents
 
 - [Overview](#Overview)
-- [Installation](#installation)
+- [Quickstart](#quickstart)
 - [Technology Stack](#Technology-Stack)
 - [Usage](#usage)
+
 
 ## Overview
 
@@ -19,13 +21,15 @@ It consists of three main modules:
     
 - **Traffic Monitor**: This background module monitors writing traffic by analyzing data from the Shard Data Store. It assesses shard health and manages both shards in Kinesis and local shard metric entries in the Shard Data Store.
 
-## Installation
+
+## Quickstart
 
 ### Prerequisites
 
 Before you begin, ensure you have the following installed on your machine:
 
 - **Rust**: Follow the instructions on the official Rust website to install Rust and the Rust package manager, Cargo.
+
 - **Docker**: Install Docker Desktop for your operating system. Ensure Docker is running before proceeding.
 
 ### Clone the Repository
@@ -39,6 +43,7 @@ git clone <repository-url> cd <repository-directory>
 ### Build the Project
 
 Once you have the repository, you can build the project using Cargo:
+
 ```Bash
 cargo build
 ```
@@ -89,9 +94,10 @@ interval_length = 1 # Length of the interval between traffic monitor checks in s
 entry_lifetime = 60 # Max life time for shard data entries in seconds before the traffic monitor removes them
 ```
 
-2. **Run the Application**: After creating the configuration file, you can run your application with:
+2. **Run the Application**: After creating the configuration file, you can run your application from the command-line with:
+
 ```Bash
-    cargo run
+cargo run
 ```
 
 ### Accessing LocalStack
@@ -105,6 +111,7 @@ To verify that everything is set up correctly, you can list the SQS queues or Ki
 ```Bash
 `aws --endpoint-url=http://localhost:4566 sqs list-queues aws --endpoint-url=http://localhost:4566 kinesis list-streams`
 ```
+
 
 ## Technology Stack
 
@@ -134,5 +141,3 @@ To verify that everything is set up correctly, you can list the SQS queues or Ki
 - **Services**:
 	- **LocalStack** 3.8.1 — Emulates **AWS SQS** and **AWS Kinesis** locally
 	- **Docker Desktop** 4.35 — Container environment for running LocalStack
-
-## Usage
