@@ -23,8 +23,10 @@ use num_bigint::{BigInt, BigUint};
 use num_traits::Zero;
 
 const MAX_CAPACITY: f64 = 1_000_000.0; // 1 MB/s capacity of a shard
-const SPLIT_THRESHOLD: f64 = 0.8; // 80% threshold
-const MERGE_THRESHOLD: f64 = 0.3; // 30% threshold
+const SPLIT_USAGE_THRESHOLD: f64 = 0.8;
+const SPLIT_TP_ERROR_THRESHOLD: u64 = 2;
+const MERGE_USAGE_THRESHOLD: f64 = 0.3;
+const MERGE_TP_ERROR_THRESHOLD: u64 = 0;
 const MONITORING_DURATION: u64 = 10; // Last 10 seconds for monitoring
 const ENTRY_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60); // 60 seconds
 
@@ -44,7 +46,7 @@ struct ShardMetrics {
     average_data_processed: f64,
     // Number of ProvisionedThrougputErrors ovre TrafficMonitor's
     // observation duration
-    throughput_errors: u64,
+    recent_throughput_errors: u64,
     // Traffic data entries for this shard
     entries: Vec<ShardMetricEntry>,
     // Submissions that are being written to this shard
@@ -57,8 +59,9 @@ struct ShardMetrics {
 #[derive(Debug, Clone)]
 struct ShardMetricEntry {
     timestamp: SystemTime,
-    data_processed: u64,
-    records_read: u64,
+    data_processed: Option<u64>,
+    records_read: Option<u64>,
+    throughput_errors: Option<u64>,
 }
 
 struct ShardDataStore {
@@ -154,7 +157,7 @@ impl ShardDataStore {
 
     // Function to record metrics data for the traffic monitor
     // Currently only stores written bytes and records
-    pub async fn record_metrics(&mut self, shard_id: String, data_size: u64, record_count: u64) {
+    pub async fn record_metrics(&mut self, shard_id: String, data_size: Option<u64>, record_count: Option<u64>, throughput_errors: Option<u64>) {
         // Find the shard in the shards vector
         let shard = self.shards.iter_mut().find(|s| s.shard_id == shard_id);
 
@@ -164,6 +167,7 @@ impl ShardDataStore {
                 timestamp: SystemTime::now(),
                 data_processed: data_size,
                 records_read: record_count,
+                throughput_errors: throughput_errors,
             });
         } else {
             // If the shard is not found, create a new entry, print an error
@@ -292,7 +296,7 @@ impl TrafficMonitor {
                                             None => return Err(WorkerError::ValidationError("Hash key range not found".to_string())),
                                         },
                                         average_data_processed: 0.0,
-                                        throughput_errors: 0,
+                                        recent_throughput_errors: 0,
                                         entries: Vec::new(),
                                         submissions: Vec::new(),
                                         is_active,
@@ -323,6 +327,9 @@ impl TrafficMonitor {
     
     // Function to check traffic and manage shards
     pub async fn manage_traffic(&mut self) {
+        println!(" # Checking traffic...");
+
+        // Get the current time
         let current_time = SystemTime::now();
 
         // Initiate a new list for shards to split
@@ -338,8 +345,8 @@ impl TrafficMonitor {
 
             // Iterate through shards
             for mut metrics in shard_data.shards.clone() {
-                println!(" ====== Checking shard {}", metrics.shard_id);
-                println!(" ====== Shard activity status: {}", metrics.is_active);
+                println!(" ## Checking shard {}", metrics.shard_id);
+                println!(" ## Shard activity status: {}", metrics.is_active);
 
                 // Remove entries older than ENTRY_LIFETIME
                 metrics.entries.retain(|entry| {
@@ -350,44 +357,59 @@ impl TrafficMonitor {
 
                 // If shard is inactive, skip the rest of the loop
                 if !metrics.is_active {
-                    println!(" ====== Shard {} is inactive", metrics.shard_id);
                     continue;
                 }
-                // Calculate the average data processed per second from all entries that
-                // fall to the monitoring duration
+                // Calculate the average data processed per second and the number of throughput errors
+                // from all entries that fall to the monitoring duration
                 let mut total_data_processed: f64 = 0.0;
                 let mut number_of_entries: u64 = 0;
+                let mut throughput_errors: u64 = 0;
                 // Iterate through shard metrics
                 for entry in &metrics.entries {
                     // Check if the metrics were recorded in the last 10 seconds
                     if let Ok(elapsed) = current_time.duration_since(entry.timestamp) {
 
                         if elapsed.as_secs() <= MONITORING_DURATION {
-                            // Add the data processed to the total
-                            total_data_processed += entry.data_processed as f64;
-                            number_of_entries += 1;
+                            if entry.data_processed.is_some() {
+                                // Add the data processed to the total
+                                total_data_processed += entry.data_processed.unwrap() as f64;
+                                number_of_entries += 1;
+                            }
+                            if entry.throughput_errors.is_some() {
+                                // Add the throughput errors to the total
+                                throughput_errors += entry.throughput_errors.unwrap();
+                            }
                         }
                     }
                 }
+
+                // Calculate the average data processed
+                // and assign it to the shard metrics object
                 metrics.average_data_processed = total_data_processed / number_of_entries as f64;
 
                 // Calculate the percentage of capacity used in average
                 let usage_percentage = (metrics.average_data_processed as f64) / MAX_CAPACITY * 100.0;
 
-                // If the usage percentage exceeds the threshold, split the shard
-                if usage_percentage >= SPLIT_THRESHOLD * 100.0 {
-                    println!("Shard {} is over 80% capacity, splitting...", metrics.shard_id);
+                // Assign the throughput errors to the shard metrics object
+                metrics.recent_throughput_errors = throughput_errors;
+
+                // If the usage percentage or the amount of recent throughput errors exceed their thresholds,
+                // assign to be split
+                if (usage_percentage >= SPLIT_USAGE_THRESHOLD * 100.0) || (metrics.recent_throughput_errors >= SPLIT_TP_ERROR_THRESHOLD) {
+                    println!(" ## Shard {} is over 80% capacity, assigning for splitting...", metrics.shard_id);
                     shards_to_split.push(metrics.shard_id.clone());
                 }
 
-                // If the usage percentage is below or equal to the merge threshold, merge the shard
-                if usage_percentage <= MERGE_THRESHOLD * 100.0 {
-                    println!("Shard {} is below or equal to 30% capacity, merging...", metrics.shard_id);
+                // If the usage percentage is below or equal to the merge threshold, and there have been no
+                // recent throughput errors, assign as a merge candidate
+                if (usage_percentage <= MERGE_USAGE_THRESHOLD * 100.0) && (metrics.recent_throughput_errors <= MERGE_TP_ERROR_THRESHOLD) {
+                    println!(" ## Shard {} is below or equal to 30% capacity, candidate for merging...", metrics.shard_id);
                     shards_to_merge.push(metrics.shard_id.clone());
                 }
                 
-                println!(" ========= Shard {} average data processed: {}", metrics.shard_id, usage_percentage);
-                println!(" ========= Submissions being written to shard {}: {:?}", metrics.shard_id, metrics.submissions);
+                println!(" ### Shard {} average data processed: {}", metrics.shard_id, usage_percentage);
+                println!(" ### Shard {} throughput errors over observation period: {}", metrics.shard_id, metrics.recent_throughput_errors);
+                println!(" ### Submissions being written to shard {}: {:?}", metrics.shard_id, metrics.submissions);
             }
         } // Release the write lock
 
@@ -404,7 +426,7 @@ impl TrafficMonitor {
 
     async fn split_shard(&mut self, shard_id: &String) {
         // Use the Kinesis client to split the shard
-        println!("#################################### Splitting shard {}", shard_id);
+        println!(" = Splitting shard: {:?}", shard_id);
 
         // Initiate variable for the new starting hash key
         let new_starting_hash_key: String;
@@ -422,7 +444,7 @@ impl TrafficMonitor {
             new_starting_hash_key = match Self::calculate_new_starting_hash_key(&shard.starting_hash_key, &shard.ending_hash_key) {
                 Ok(key) => key,
                 Err(e) => {
-                    println!("Error calculating new starting hash key: {:?}", e);
+                    println!(" == Error calculating new starting hash key: {:?}", e);
                     return;
                 },
             };
@@ -437,14 +459,14 @@ impl TrafficMonitor {
             .await;
     
         match split_result {
-            Ok(_) => println!("Successfully split shard: {:?}", shard_id),
-            Err(err) => println!("Error splitting shard: {:?}", err),
+            Ok(_) => println!(" === Successfully split shard: {:?}", shard_id),
+            Err(err) => println!(" === Error splitting shard: {:?}", err),
         }
 
         // Update the shard data store list
         match self.update_shard_data_store_list().await {
-            Ok(_) => println!(" Shard data store updated"),
-            Err(e) => println!("Error updating shard data store: {:?}", e),
+            Ok(_) => println!(" ==== Shard data store updated"),
+            Err(e) => println!(" ==== Error updating shard data store: {:?}", e),
         }
     }
 
@@ -1051,7 +1073,7 @@ impl SubmissionWorker {
                         let mut shard_data = self.shard_data.write().await;
 
                         // Record the amount of bytes written to the shard
-                        shard_data.record_metrics(shard_id, json_string.as_bytes().len() as u64, 1).await;
+                        shard_data.record_metrics(shard_id, Some(json_string.as_bytes().len() as u64), Some(1), None).await;
                     }
 
                     println!(" -- Event written to shard {}", response.shard_id);
@@ -1075,8 +1097,16 @@ impl SubmissionWorker {
                             // Match against the PutRecordError variants
                             match put_record_error {
                                 PutRecordError::ProvisionedThroughputExceededException(e) => {
-                                    // Rate has exceeded for this shard, get a new shard for the next attempt
-                                    println!("ProvisionedThroughputExceededException occurred: {:?}", e);
+                                    println!(" --- ProvisionedThroughputExceededException occurred: {:?}", e);
+
+                                    // Rate has exceeded for this shard
+                                    // Record it in the shard data store
+                                    { // Acquire a write lock
+                                        let mut shard_data = self.shard_data.write().await;
+                                        shard_data.record_metrics(shard_id, None, None, Some(1)).await;
+                                    } // Release the write lock
+
+                                    // Get a new shard for the next attempt
                                     { // Acquire a read lock
                                         let shard_data = self.shard_data.read().await;
                                         // Get a new shard
