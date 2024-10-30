@@ -19,6 +19,10 @@ use tokio::{
     task,
     time::sleep,
 };
+use uuid::Uuid;
+
+const VISIBILITY_TIMEOUT: i32 = 5; // Period for which the message is invisible in the queue after a worker has read it
+const MAX_NUMBER_OF_MESSAGES: i32 = 10; // Maximum number of messages to read from the queue in a single request
 
 // Handles
 // - Reading of submissions from the SQS
@@ -53,6 +57,8 @@ impl SubmissionWorker {
             // Read a submission from SQS, spawn a task to process it or log an error
             match self.sqs_client
                 .receive_message()
+                .visibility_timeout(VISIBILITY_TIMEOUT)
+                .max_number_of_messages(MAX_NUMBER_OF_MESSAGES)
                 .send()
                 .await {
                 Ok(submission) => {
@@ -188,7 +194,7 @@ impl SubmissionWorker {
                 // Create an EventWrapper struct to hold the event data
                 let event_wrapper = EventWrapper {
                     event_type: EventType::NetworkConnection(event.clone()),
-                    event_id: "some_event_id".to_string(),
+                    event_id: Uuid::new_v4().to_string(),
                     submission_id: submission.submission_id.clone(),
                     order: order as u32,
                     time_created: submission.time_created.clone(),
