@@ -1,0 +1,13 @@
+[submission_worker]
+visibility_timeout = 60 # Visibility timeout in seconds for the SQS message
+max_number_of_messages = 10 # Maximum number of messages to be received from SQS with one request
+
+[traffic_monitor]
+max_capacity = 1_000_000.0 # 1 MB/s capacity of a shard
+split_usage_threshold = 0.8 # Value of usage capacity (higher bound) to trigger a shard split
+split_tp_error_threshold = 2 # Number of tolerable errors (higher bound) during a monitoring period to trigger a shard split
+merge_usage_threshold = 0.001 # Value of usage capacity (lower bound) to trigger a shard merge
+merge_tp_error_threshold = 0 # Number of tolerable errors (lower bound) during a monitoring period to trigger a shard merge
+observation_period = 10 # Duration of one monitoring period in seconds, from where the traffic monitor will consider the usage and errors
+interval_length = 1 # Length of the interval between traffic monitor checks in seconds
+entry_lifetime = 60 # Max life time for shard data entries in seconds before the traffic monitor removes them
