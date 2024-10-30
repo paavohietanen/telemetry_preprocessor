@@ -1,6 +1,9 @@
 [submission_worker]
 visibility_timeout = 60 # Visibility timeout in seconds for the SQS message
 max_number_of_messages = 10 # Maximum number of messages to be received from SQS with one request
+polling_interval = 1 # Polling interval in seconds for the SQS queue
+max_retry_attempts = 3 # Maximum number of retry attempts for a failed request
+retry_interval = 1 # Retry interval in seconds for a failed request
 
 [traffic_monitor]
 max_capacity = 1_000_000.0 # 1 MB/s capacity of a shard

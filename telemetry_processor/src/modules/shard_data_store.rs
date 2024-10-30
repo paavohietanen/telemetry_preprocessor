@@ -103,12 +103,12 @@ impl ShardDataStore {
         }
     }
 
-    // Add a submission id to the shard
+    // Add a submission id to the shard metric to mark it as being written to the respective shard
     pub fn add_submission(&mut self, shard_id: &str, submission_id: &str) {
-        // Find the shard in the shards vector
+        // Find the shard metric in the shards vector
         let shard = self.shards.iter_mut().find(|s| s.shard_id == shard_id);
 
-        // If the shard is found, add the submission id
+        // If the shard metric is found, add the submission id
         if let Some(shard) = shard {
             shard.submissions.push(submission_id.to_string());
         }

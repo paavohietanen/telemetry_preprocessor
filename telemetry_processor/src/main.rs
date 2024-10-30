@@ -16,6 +16,13 @@ use std::sync::Arc;
 mod config;
 mod modules;
 
+
+// Main function to start the telemetry processor
+// This function will:
+// 1. Prepare the needed configurations and clients
+// 2. Initiate the ShardDataStore to store shard data for SubmissionWorkers and TrafficMonitor
+// 3. Start the TrafficMonitor to monitor traffic and manage resources in the background
+// 4. Start the SubmissionWorker to read, process and write submissions from SQS to Kinesis
 #[tokio::main]
 async fn main() {
 
@@ -24,11 +31,11 @@ async fn main() {
         .region(Region::new("eu-west-1"))
         .endpoint_url("http://localhost:4566/000000000000/submissions") // Queue URL: Differs from 'list-queues' URL, that one gives error
         .credentials_provider(SQSConfig::Credentials::new(
-            "some_key_id",      // Access key for LocalStack
-            "some_secret",  // Secret key for LocalStack
-            None,               // Optional session token
-            None,               // Expiry (optional)
-            "localstack",       // Provider name
+            "some_key_id", // Access key for LocalStack
+            "some_secret", // Secret key for LocalStack
+            None, // Optional session token
+            None, // Expiry (optional)
+            "localstack", // Provider name
         ))
         .build();
 
@@ -40,11 +47,11 @@ async fn main() {
         .region(Region::new("eu-west-1"))
         .endpoint_url("http://localhost:4566/") // Kinesis uses the root URL
         .credentials_provider(KinesisConfig::Credentials::new(
-            "some_key_id",      // Access key for LocalStack
-            "some_secret",  // Secret key for LocalStack
-            None,               // Optional session token
-            None,               // Expiry (optional)
-            "localstack",       // Provider name
+            "some_key_id", // Access key for LocalStack
+            "some_secret", // Secret key for LocalStack
+            None, // Optional session token
+            None, // Expiry (optional)
+            "localstack", // Provider name
         ))
         .build();
 
@@ -53,8 +60,6 @@ async fn main() {
 
     // Create a new, shared ShardDataStore instance using RWLock
     let shard_data = Arc::new(RwLock::new(ShardDataStore::new()));
-
-    println!("Current directory: {:?}", std::env::current_dir());
 
     // Load the configuration for SubmissionWorker and TrafficMonitor from Config.toml
     let config = match config::load_config("telemetry_processor/Config.toml") {
