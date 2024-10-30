@@ -5,9 +5,11 @@ use aws_sdk_kinesis::{
 use aws_sdk_sqs::client::Client as SQSClient;
 use aws_sdk_sqs::types::Message;
 use base64::{self, Engine, engine::general_purpose};
-use crate::modules::{
-    error::WorkerError,
-    shard_data_store::ShardDataStore,
+use crate::{config,
+        modules::{
+        error::WorkerError,
+        shard_data_store::ShardDataStore,
+        },
 };
 use std::{
     sync::Arc,
@@ -20,9 +22,6 @@ use tokio::{
     time::sleep,
 };
 use uuid::Uuid;
-
-const VISIBILITY_TIMEOUT: i32 = 5; // Period for which the message is invisible in the queue after a worker has read it
-const MAX_NUMBER_OF_MESSAGES: i32 = 10; // Maximum number of messages to read from the queue in a single request
 
 // Handles
 // - Reading of submissions from the SQS
@@ -42,11 +41,14 @@ pub struct SubmissionWorker {
     // ShardDataStore for recording metrics
     // A shared resource between TrafficMonitor and SubmissionWorkers
     shard_data: Arc<RwLock<ShardDataStore>>,
+
+    // Config for SubmissionWorker
+    config: config::SubmissionWorkerConfig,
 }
 
 impl SubmissionWorker {
-    pub fn new(sqs_client: aws_sdk_sqs::Client, kinesis_client: aws_sdk_kinesis::Client, shard_data: Arc<RwLock<ShardDataStore>>) -> Self {
-        Self { sqs_client, kinesis_client, shard_data }
+    pub fn new(sqs_client: aws_sdk_sqs::Client, kinesis_client: aws_sdk_kinesis::Client, shard_data: Arc<RwLock<ShardDataStore>>, config: config::SubmissionWorkerConfig) -> Self {
+        Self { sqs_client, kinesis_client, shard_data, config }
     }
 
     // Main loop for submission processing
@@ -57,8 +59,8 @@ impl SubmissionWorker {
             // Read a submission from SQS, spawn a task to process it or log an error
             match self.sqs_client
                 .receive_message()
-                .visibility_timeout(VISIBILITY_TIMEOUT)
-                .max_number_of_messages(MAX_NUMBER_OF_MESSAGES)
+                .visibility_timeout(self.config.visibility_timeout)
+                .max_number_of_messages(self.config.max_number_of_messages)
                 .send()
                 .await {
                 Ok(submission) => {

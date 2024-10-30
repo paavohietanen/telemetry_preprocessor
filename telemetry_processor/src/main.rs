@@ -9,13 +9,16 @@ use crate::modules::{
     submission_worker::SubmissionWorker,
     traffic_monitor::TrafficMonitor,
 };
-use tokio::{time, sync::RwLock};
+use tokio::sync::RwLock;
 use std::sync::Arc;
 
+
+mod config;
 mod modules;
 
 #[tokio::main]
 async fn main() {
+
     // Build the configuration for SQS
     let sqs_config = SQSConfig::Builder::new()
         .region(Region::new("eu-west-1"))
@@ -51,9 +54,22 @@ async fn main() {
     // Create a new, shared ShardDataStore instance using RWLock
     let shard_data = Arc::new(RwLock::new(ShardDataStore::new()));
 
+    println!("Current directory: {:?}", std::env::current_dir());
+
+    // Load the configuration for SubmissionWorker and TrafficMonitor from Config.toml
+    let config = match config::load_config("telemetry_processor/Config.toml") {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("Error loading configuration: {}", e);
+            return;
+        }
+    };
 
     // Create a new TrafficMonitor instance
-    let mut monitor = TrafficMonitor::new(kinesis_client.clone(), time::Duration::from_secs(3), shard_data.clone());
+    let mut monitor = TrafficMonitor::new(
+        kinesis_client.clone(),
+        shard_data.clone(), 
+        config.traffic_monitor);
 
     // Start monitoring traffic
     tokio::spawn(async move {
@@ -61,7 +77,7 @@ async fn main() {
     });
 
     // Create a new SubmissionWorker instance
-    let worker = SubmissionWorker::new(sqs_client, kinesis_client, shard_data.clone());
+    let worker = SubmissionWorker::new(sqs_client, kinesis_client, shard_data.clone(), config.submission_worker);
 
     // Run the worker
     worker.run().await;

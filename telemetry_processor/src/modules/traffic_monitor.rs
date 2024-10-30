@@ -1,50 +1,57 @@
-use tokio::sync::RwLock;
+use tokio::{
+    sync::RwLock,
+    time::{
+        Duration,
+        sleep,
+    },
+};
 use std::{
     sync::Arc,
     time::SystemTime,
 };
 use num_bigint::BigInt;
 
-use crate::modules::{
+use crate::{
+    config,
+    modules::{
         shard_data_store::{
         ShardDataStore,
         ShardMetrics,
+        },
+        error::WorkerError,
     },
-    error::WorkerError,
 };
 
-const MAX_CAPACITY: f64 = 1_000_000.0; // 1 MB/s capacity of a shard
-const SPLIT_USAGE_THRESHOLD: f64 = 0.8;
-const SPLIT_TP_ERROR_THRESHOLD: u64 = 2;
-const MERGE_USAGE_THRESHOLD: f64 = 0.001;
-const MERGE_TP_ERROR_THRESHOLD: u64 = 0;
-const MONITORING_DURATION: u64 = 10; // Last 10 seconds for monitoring
-const ENTRY_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60); // 60 seconds
-
 pub struct TrafficMonitor {
+
     // Kinesis client to fetch shards
     kinesis_client: aws_sdk_kinesis::Client,
-    // Interval for the monitoring loop
-    check_interval: tokio::time::Duration,
+
     // ShardDataStore for managing traffic data
     // A shared resource between TrafficMonitor and SubmissionWorkers
     shard_data: Arc<RwLock<ShardDataStore>>,
+
+    // Configuration for TrafficMonitor
+    config: config::TrafficMonitorConfig,
 }
 
 impl TrafficMonitor {
 
-    pub fn new(kinesis_client: aws_sdk_kinesis::Client, check_interval: tokio::time::Duration, shard_data: Arc<RwLock<ShardDataStore>>) -> Self {
+    pub fn new(kinesis_client: aws_sdk_kinesis::Client,
+        shard_data: Arc<RwLock<ShardDataStore>>,
+        config: config::TrafficMonitorConfig) -> Self {
+        // Load the configuration for SubmissionWorker and TrafficMonitor from Config.toml
         Self {
             kinesis_client,
-            check_interval,
             shard_data,
+            config,
         }
     }
 
     // Function to start monitoring traffic
     pub async fn start_monitoring(&mut self) {
 
-        // First update the shard data of the shard data store
+        // First, update the shard data of the shard data store
         match self.update_shard_data_store_list().await {
             Ok(_) => println!(" Shard data store updated"),
             // TODO: Check if requires better handling
@@ -55,7 +62,7 @@ impl TrafficMonitor {
         loop {
             // Check traffic conditions
             self.manage_traffic().await;
-            tokio::time::sleep(self.check_interval).await;
+            sleep(Duration::from_secs(self.config.interval_length)).await;
         };
     }
 
@@ -200,7 +207,7 @@ impl TrafficMonitor {
                 // Remove entries older than ENTRY_LIFETIME
                 metrics.entries.retain(|entry| {
                     current_time.duration_since(entry.timestamp).map_or(false, |elapsed| {
-                        elapsed <= ENTRY_LIFETIME
+                        elapsed <= tokio::time::Duration::from_secs(self.config.entry_lifetime)
                     })
                 });
 
@@ -218,7 +225,7 @@ impl TrafficMonitor {
                     // Check if the metrics were recorded in the last 10 seconds
                     if let Ok(elapsed) = current_time.duration_since(entry.timestamp) {
 
-                        if elapsed.as_secs() <= MONITORING_DURATION {
+                        if elapsed.as_secs() <= self.config.observation_period {
                             if entry.data_processed.is_some() {
                                 // Add the data processed to the total
                                 total_data_processed += entry.data_processed.unwrap() as f64;
@@ -237,21 +244,23 @@ impl TrafficMonitor {
                 metrics.average_data_processed = total_data_processed / number_of_entries as f64;
 
                 // Calculate the percentage of capacity used in average
-                let usage_percentage = (metrics.average_data_processed as f64) / MAX_CAPACITY * 100.0;
+                let usage_percentage = (metrics.average_data_processed as f64) / self.config.max_capacity * 100.0;
 
                 // Assign the throughput errors to the shard metrics object
                 metrics.recent_throughput_errors = throughput_errors;
 
                 // If the usage percentage or the amount of recent throughput errors exceed their thresholds,
                 // assign to be split
-                if (usage_percentage >= SPLIT_USAGE_THRESHOLD * 100.0) || (metrics.recent_throughput_errors >= SPLIT_TP_ERROR_THRESHOLD) {
+                if (usage_percentage >= self.config.split_usage_threshold * 100.0)
+                    || (metrics.recent_throughput_errors >= self.config.split_tp_error_threshold) {
                     println!(" ## Shard {} is over 80% capacity, assigning for splitting...", metrics.shard_id);
                     shards_to_split.push(metrics.shard_id.clone());
                 }
 
                 // If the usage percentage is below or equal to the merge threshold, and there have been no
                 // recent throughput errors, assign as a merge candidate
-                if (usage_percentage <= MERGE_USAGE_THRESHOLD * 100.0) && (metrics.recent_throughput_errors <= MERGE_TP_ERROR_THRESHOLD) {
+                if (usage_percentage <= self.config.merge_usage_threshold * 100.0) 
+                    && (metrics.recent_throughput_errors <= self.config.merge_tp_error_threshold) {
                     println!(" ## Shard {} is below or equal to 30% capacity, candidate for merging...", metrics.shard_id);
                     shards_to_merge.push(metrics.shard_id.clone());
                 }
