@@ -21,6 +21,7 @@ It consists of three main modules:
     
 - **Traffic Monitor**: This background module monitors writing traffic by analyzing data from the Shard Data Store. It assesses shard health and manages both shards in Kinesis and local shard metric entries in the Shard Data Store.
 
+See description of the program architecture [here](./architecture.md)
 
 ## Quickstart
 
@@ -37,7 +38,8 @@ Before you begin, ensure you have the following installed on your machine:
 Start by cloning the repository to your local machine:
 
 ```Bash
-git clone https://github.com/paavohietanen/telemetry_preprocessor.git cd telemetry-processor
+git clone https://github.com/paavohietanen/telemetry_preprocessor.git
+cd telemetry-processor
 ```
 
 ### Build the Project
