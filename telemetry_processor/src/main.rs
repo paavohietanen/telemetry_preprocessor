@@ -77,7 +77,7 @@ impl ShardDataStore {
 
     // Add a single new shard with ShardMetrics object
     pub fn add_shard(&mut self, shard: ShardMetrics) {
-        println!("Shard {} added", shard.shard_id);
+        println!(" ~~~ Shard {} added", shard.shard_id);
         self.shards.push(shard);
     }
 
@@ -217,7 +217,9 @@ impl TrafficMonitor {
 
     // Update shard list of the shard data store to reflect the current state of the stream
     async fn update_shard_data_store_list(&self) -> Result<(), WorkerError> {
-        println!(" === Updating shard data store list...");
+
+        println!(" ~ Updating shard data store list...");
+
         // Kinesis might return the shards in multiple responses
         // To get all subsets of shards, we need a marker from where to start
         // retrieving the next batch of shards, if any left.
@@ -226,15 +228,14 @@ impl TrafficMonitor {
 
         // Loop to handle paginated results
         loop {
-            // Describe the stream to get shard information
+
+            // Include a request to list the shards of the stream
             let mut request = self.kinesis_client.list_shards()
             .stream_name("events"); // Stream name
-            println!("IN BEGINNING, NEXT TOKEN IS: {:?}", next_token);
-            // Only add exclusive_start_shard_id if next_token is Some
+
+            // Only add exclusive_start_shard_id to the request if next_token is Some
             if let Some(ref token) = next_token {
-                println!(" === TOKEN: {:?}", token);
                 request = request.next_token(token); // Use token directly
-                //println!(" === REQUEST: {:?}", request);
             }
 
             // Send the request and await the response
@@ -242,11 +243,11 @@ impl TrafficMonitor {
 
             match response {
                 Ok(ref res) => {
-                    println!(" === HANDLING RESPONSE");
-                    println!("SHARDS IN RESPONSE {:?}", res.shards);
+                    println!(" ~~ Handling shards in response...");
                     if let Some(ref shards) = res.shards {
                         // Append the shard IDs to the list
                         for shard in shards {
+
                             // Check if the shard is active (can be written to) or inactive (can't be written to).
                             // Active shards are the ones with an open-ended sequence number range, having no ending sequence number.
                             let is_active = shard.sequence_number_range().and_then(|range| range.ending_sequence_number()).is_none();
@@ -277,7 +278,7 @@ impl TrafficMonitor {
 
                                             // Set the shard to inactive
                                             inactive_shard.is_active = is_active;
-                                            println!("-------------------------- Shard {} activity status updated to {:?}", shard.shard_id, is_active);
+                                            println!(" ~~~ Shard {} activity status updated to {:?}", shard.shard_id, is_active);
                                         } // Release the write lock
                                     }
                                 }
@@ -310,7 +311,6 @@ impl TrafficMonitor {
 
                         // Break the loop if there are no more shards to process
                         if next_token.is_none() {
-                            println!(" === NO MORE TOKENS");
                             return Ok(());
                         }
                     }
@@ -321,6 +321,7 @@ impl TrafficMonitor {
                 }
             }
         }
+        println!(" ~~~~~ Shard data store update concludes");
         Ok(())
     }
 
@@ -984,9 +985,9 @@ impl SubmissionWorker {
     }
 
     async fn handle_writing(&self, events: Vec<EventWrapper>) -> Result<(), WorkerError> {
-        println!(" - Writing events to Kinesis...");
         // Clone the id of this submission to a new variable
         let submission_id = &events[0].submission_id.clone();
+        println!(" - Initiating submission writing for {:?}...", submission_id);
 
         // Initiate a variable for shard id
         let shard_id: String;
@@ -1028,6 +1029,7 @@ impl SubmissionWorker {
     }
 
     async fn write(&self, event: EventWrapper, mut shard_id: String) -> Result<(), WorkerError> {
+        println!(" -- Writing event to shard {}", shard_id);
         // Set the initial retry wait time
         let mut wait_time = tokio::time::Duration::from_secs(1);
 
@@ -1076,7 +1078,7 @@ impl SubmissionWorker {
                         shard_data.record_metrics(shard_id, Some(json_string.as_bytes().len() as u64), Some(1), None).await;
                     }
 
-                    println!(" -- Event written to shard {}", response.shard_id);
+                    println!(" --- Event written to shard {}", response.shard_id);
 
                     // Return Ok
                     return Ok(()); // Success
@@ -1086,7 +1088,7 @@ impl SubmissionWorker {
                 Err(err) => {
                     // Add error to array
                     errors.push(err.to_string());
-                    println!(" -- Error writing event, attempt {}: {:?}", attempt + 1, err);
+                    println!(" --- Error writing event, attempt {}: {:?}", attempt + 1, err);
 
                     // Match against the error type and react accordingly
                     match err {
@@ -1097,7 +1099,6 @@ impl SubmissionWorker {
                             // Match against the PutRecordError variants
                             match put_record_error {
                                 PutRecordError::ProvisionedThroughputExceededException(e) => {
-                                    println!(" --- ProvisionedThroughputExceededException occurred: {:?}", e);
 
                                     // Rate has exceeded for this shard
                                     // Record it in the shard data store
@@ -1114,9 +1115,8 @@ impl SubmissionWorker {
                                             Ok(id) => id.clone(), // Clone the id to return it
                                             Err(e) => return Err(e.clone()),
                                         };
-                                        println!("New shard ID: {}", shard_id);
                                     } // Release the read lock
-                                    println!("Retrying with shard {}", shard_id);
+                                    println!(" ---- Retrying with shard {}", shard_id);
                                 }
                                 // Handle other specific PutRecordError cases if needed
                                 // Todo: Implement logic
@@ -1138,7 +1138,6 @@ impl SubmissionWorker {
                         }
                     }
 
-                    
                     // Wait for the retry time
                     tokio::time::sleep(wait_time).await;
                     
@@ -1168,13 +1167,13 @@ impl SubmissionWorker {
                     Err(e) => return Err(e.clone()),
                 };
                 shard_id = new_shard_id; // Assign the new shard ID
-
-                { // Acquire write lock to add this submission to the new shard
-                    let mut shard_data = self.shard_data.write().await;
-                    shard_data.add_submission(&shard_id, submission_id);
-                } // Release the write lock
             }
         } // Lock is released here
+
+        { // Acquire write lock to add this submission to the new shard
+            let mut shard_data = self.shard_data.write().await;
+            shard_data.add_submission(&shard_id, submission_id);
+        } // Release the write lock
 
         // Return the shard ID
         Ok(shard_id)
