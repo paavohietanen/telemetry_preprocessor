@@ -37,7 +37,7 @@ Before you begin, ensure you have the following installed on your machine:
 Start by cloning the repository to your local machine:
 
 ```Bash
-git clone <repository-url> cd <repository-directory>
+git clone https://github.com/paavohietanen/telemetry_preprocessor.git cd telemetry-processor
 ```
 
 ### Build the Project
