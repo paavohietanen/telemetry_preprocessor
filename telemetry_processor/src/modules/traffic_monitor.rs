@@ -16,7 +16,7 @@ use crate::modules::{
 const MAX_CAPACITY: f64 = 1_000_000.0; // 1 MB/s capacity of a shard
 const SPLIT_USAGE_THRESHOLD: f64 = 0.8;
 const SPLIT_TP_ERROR_THRESHOLD: u64 = 2;
-const MERGE_USAGE_THRESHOLD: f64 = 0.3;
+const MERGE_USAGE_THRESHOLD: f64 = 0.001;
 const MERGE_TP_ERROR_THRESHOLD: u64 = 0;
 const MONITORING_DURATION: u64 = 10; // Last 10 seconds for monitoring
 const ENTRY_LIFETIME: std::time::Duration = std::time::Duration::from_secs(60); // 60 seconds
@@ -74,12 +74,16 @@ impl TrafficMonitor {
         loop {
 
             // Include a request to list the shards of the stream
-            let mut request = self.kinesis_client.list_shards()
-            .stream_name("events"); // Stream name
+            let mut request = self.kinesis_client.list_shards();
+            
 
             // Only add exclusive_start_shard_id to the request if next_token is Some
             if let Some(ref token) = next_token {
                 request = request.next_token(token); // Use token directly
+            }
+            else {
+                // Use stream name directly if no token. If we have both, there will be an InvalidArgumentException
+                request = request.stream_name("events"); 
             }
 
             // Send the request and await the response
@@ -319,17 +323,13 @@ impl TrafficMonitor {
         // Convert the hash keys from strings to u64 (or any other numeric type as needed)
         let starting_key: BigInt = match original_starting_hash_key.parse::<BigInt>() {
             Ok(key) => key,
-            Err(_) => {print!("ERROR PARSING STARTING KEY");
-                return Err(WorkerError::ValidationError("Error parsing starting key".to_string()));
-            }
-            ,
+            Err(_) => return Err(WorkerError::ValidationError("Error parsing starting key".to_string())),
         };
         println!("Starting key: {:?}", starting_key);
         println!("Ending key: {:?}", original_ending_hash_key);
         let ending_key: BigInt = match original_ending_hash_key.parse::<BigInt>() {
             Ok(key) => key,
-            Err(_) => {print!("ERROR PARSING ENDING KEY");
-                return Err(WorkerError::ValidationError("Error parsing ending key".to_string()))}
+            Err(_) => return Err(WorkerError::ValidationError("Error parsing ending key".to_string()))
         };
     
         // Calculate the midpoint (this is the new starting hash key for one of the split shards)
@@ -344,7 +344,7 @@ impl TrafficMonitor {
 
         // Initialize a vector for objects that were merged
         let mut merged_shards: Vec<String> = Vec::new();
-        println!("%%%%%%%%%%%%%%%%%%%%%%%%% Merging shards...");
+        println!("% Merging shards...");
         // Initialize a vector for corresponding SharedMetrics objects
         let mut shards: Vec<ShardMetrics> = Vec::new();
         { // Acquire a read lock
@@ -363,13 +363,13 @@ impl TrafficMonitor {
             if shards[i].is_active {
                 // Check for a pair to merge with
                 for j in (i + 1)..shards.len() {
-                    println!(" %%%%% ACTIVITY SHARD i {:?} {:?} SHARD j {:?} {:?}", shards[i].shard_id, shards[i].is_active, shards[j].shard_id, shards[j].is_active);
+                    println!(" %% Activity shard i {:?} {:?} shard j {:?} {:?}", shards[i].shard_id, shards[i].is_active, shards[j].shard_id, shards[j].is_active);
                     if shards[j].is_active && Self::is_adjacent(&shards[i], &shards[j]) {
-                        println!("%%%%%%%%%%%%%%%%%%%%%%%%% Merging shards: {:?} {:?}", shards[i].shard_id, shards[j].shard_id);
+                        println!(" %%% Merging shards: {:?} {:?}", shards[i].shard_id, shards[j].shard_id);
                         let merge_result = &self.merge_shard(&shards[i].shard_id, &shards[j].shard_id).await;
 
                         if merge_result.is_ok() {
-                            println!(" &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&& SUCCESSFUL MERGE &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&");
+                            println!(" %%%% Successful merge");
                             // Add the merged shards to the list
                             merged_shards.push(shards[i].shard_id.clone());
                             merged_shards.push(shards[j].shard_id.clone());
@@ -379,25 +379,11 @@ impl TrafficMonitor {
                         }
                     }
                     else {
-                        println!("%%%%%%%%%%%%%%%%%%%%%%%%% Shards {:?} and {:?} are not adjacent, or other is not active", shards[i].shard_id, shards[j].shard_id);
+                        println!(" %%%% Shards {:?} and {:?} are not adjacent, or other is not active", shards[i].shard_id, shards[j].shard_id);
                     }
                 }
             }
         }
-        // Loop through the merged shards and set their activity to false
-        /*for shard_id in merged_shards {
-            { // Acquire a write lock
-                let mut shard_data = self.shard_data.write().await;
-                let shard = match shard_data.get_shard_by_id_mut(shard_id.clone()) {
-                    Some(s) => s,
-                    None => {
-                        println!("Shard {} not found", shard_id);
-                        return Err(WorkerError::ValidationError("Shard not found".to_string()));
-                    },
-                };
-                shard.is_active = false;
-            } // Release the write lock
-        };*/
         // Update the shard data store list to get the newly merged shards
         // and set old ones to inactive
         match self.update_shard_data_store_list().await {
@@ -405,15 +391,15 @@ impl TrafficMonitor {
             Err(e) => println!("Error updating shard data store: {:?}", e),
         }
 
-        println!("%%%%%%%%%%%%%%%%%%%%%%%%% Exiting merging loop");
+        println!("%%%%% Concluding merge");
         Ok(())
     }
 
     // Check to see if shards are adjacent
     fn is_adjacent(shard_a: &ShardMetrics, shard_b: &ShardMetrics) -> bool {
         // Check if the end of shard_a matches the start of shard_b
-        println!(" ¤¤¤¤¤¤¤¤¤¤ END SHARD i {:?} START SHARD j {:?}", shard_a.ending_hash_key, shard_b.starting_hash_key);
-        println!(" ¤¤¤¤¤¤¤¤¤¤ END SHARD j {:?} START SHARD i {:?}", shard_b.ending_hash_key, shard_a.starting_hash_key);
+        println!(" ¤ End shard i {:?}, start shard j {:?}", shard_a.ending_hash_key, shard_b.starting_hash_key);
+        println!(" ¤ Start shard i {:?}, end shard j {:?} ", shard_a.starting_hash_key, shard_b.ending_hash_key);
         // First parse both keys to BigInt
         let starting_key_a = match shard_a.starting_hash_key.parse::<BigInt>() {
             Ok(key) => key,
@@ -446,7 +432,7 @@ impl TrafficMonitor {
         let is_adjacent = ending_key_a + 1 == starting_key_b
             || ending_key_b + 1 == starting_key_a;
         
-        println!(" ¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤¤ IS ADJACENT {:?}", is_adjacent);
+        println!(" ¤¤ Adjacency is {:?}", is_adjacent);
         is_adjacent
     }
 
