@@ -42,6 +42,9 @@ struct ShardMetrics {
     // Average data processed per entry over TrafficMonitor's
     // observation duration
     average_data_processed: f64,
+    // Number of ProvisionedThrougputErrors ovre TrafficMonitor's
+    // observation duration
+    throughput_errors: u64,
     // Traffic data entries for this shard
     entries: Vec<ShardMetricEntry>,
     // Submissions that are being written to this shard
@@ -289,6 +292,7 @@ impl TrafficMonitor {
                                             None => return Err(WorkerError::ValidationError("Hash key range not found".to_string())),
                                         },
                                         average_data_processed: 0.0,
+                                        throughput_errors: 0,
                                         entries: Vec::new(),
                                         submissions: Vec::new(),
                                         is_active,
@@ -514,7 +518,7 @@ impl TrafficMonitor {
             }
         }
         // Loop through the merged shards and set their activity to false
-        for shard_id in merged_shards {
+        /*for shard_id in merged_shards {
             { // Acquire a write lock
                 let mut shard_data = self.shard_data.write().await;
                 let shard = match shard_data.get_shard_by_id_mut(shard_id.clone()) {
@@ -526,7 +530,13 @@ impl TrafficMonitor {
                 };
                 shard.is_active = false;
             } // Release the write lock
-        };
+        };*/
+        // Update the shard data store list to get the newly merged shards
+        // and set old ones to inactive
+        match self.update_shard_data_store_list().await {
+            Ok(_) => println!(" Shard data store updated"),
+            Err(e) => println!("Error updating shard data store: {:?}", e),
+        }
 
         println!("%%%%%%%%%%%%%%%%%%%%%%%%% Exiting merging loop");
         Ok(())
@@ -952,6 +962,7 @@ impl SubmissionWorker {
     }
 
     async fn handle_writing(&self, events: Vec<EventWrapper>) -> Result<(), WorkerError> {
+        println!(" - Writing events to Kinesis...");
         // Clone the id of this submission to a new variable
         let submission_id = &events[0].submission_id.clone();
 
@@ -1043,6 +1054,8 @@ impl SubmissionWorker {
                         shard_data.record_metrics(shard_id, json_string.as_bytes().len() as u64, 1).await;
                     }
 
+                    println!(" -- Event written to shard {}", response.shard_id);
+
                     // Return Ok
                     return Ok(()); // Success
                 }
@@ -1051,7 +1064,7 @@ impl SubmissionWorker {
                 Err(err) => {
                     // Add error to array
                     errors.push(err.to_string());
-                    //println!("Error writing event, attempt {}: {:?}", attempt + 1, err);
+                    println!(" -- Error writing event, attempt {}: {:?}", attempt + 1, err);
 
                     // Match against the error type and react accordingly
                     match err {
